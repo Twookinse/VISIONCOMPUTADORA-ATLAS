@@ -1,0 +1,28 @@
+# Entorno virtual
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Modelos YOLO (archivos pesados)
+*.pt
+*.onnx
+
+# Videos (archivos pesados)
+videos/*.mp4
+videos/*.avi
+videos/*.mov
+
+# Variables de entorno
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+Thumbs.db
