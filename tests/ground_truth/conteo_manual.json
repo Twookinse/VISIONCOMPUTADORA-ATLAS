@@ -1,0 +1,11 @@
+{
+  "descripcion": "Conteo manual (ground truth) de jarras levantadas en los videos de prueba. Se usa para medir la precision del conteo automatico.",
+  "videos": {
+    "VIDEO 2 VISION COMPUTADORA.mp4": {
+      "jarras_levantadas": 3,
+      "visibles": 2,
+      "tapadas": 1,
+      "notas": "Una de las tres veces la jarra queda tapada por el cuerpo de una persona."
+    }
+  }
+}

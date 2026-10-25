@@ -1,0 +1,11 @@
+# Configuracion de ByteTrack ajustada para cocina (camara fija, objetos que
+# se tapan seguido con las manos o el cuerpo).
+# Basado en el archivo por defecto de ultralytics (cfg/trackers/bytetrack.yaml).
+
+tracker_type: bytetrack
+track_high_thresh: 0.25   # Confianza minima para la primera etapa de asociacion
+track_low_thresh: 0.1     # Permite recuperar objetos con deteccion debil
+new_track_thresh: 0.3     # Un poco mas alto que el default para no crear IDs nuevos de mas
+track_buffer: 90          # Frames que se recuerda un objeto perdido (default 30). Ayuda cuando una mano tapa la jarra
+match_thresh: 0.8         # Umbral de asociacion entre frames
+fuse_score: True          # Combina confianza y movimiento para asociar
