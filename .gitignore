@@ -16,6 +16,12 @@ videos/*.mp4
 videos/*.avi
 videos/*.mov
 
+# Resultados generados por los scripts (videos procesados)
+output/
+
+# Documentacion privada
+docs/*.pdf
+
 # Variables de entorno
 .env
 

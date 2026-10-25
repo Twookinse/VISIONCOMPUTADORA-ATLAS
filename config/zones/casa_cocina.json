@@ -1,0 +1,11 @@
+{
+  "descripcion": "Zonas de interes (ROI) de la cocina. Las coordenadas estan normalizadas de 0 a 1 respecto al ancho y alto del frame, para que funcionen con cualquier resolucion de camara.",
+  "zonas": [
+    {
+      "nombre": "mesa",
+      "tipo": "reposo",
+      "descripcion": "Zona donde descansan las jarras. Si una jarra sale de aqui hacia arriba se considera levantada.",
+      "puntos": [[0.32, 0.62], [0.99, 0.62], [0.99, 0.99], [0.32, 0.99]]
+    }
+  ]
+}

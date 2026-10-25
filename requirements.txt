@@ -1,11 +1,11 @@
 # Dependencias del proyecto (Python 3.11)
 # Instalacion: pip install -r requirements.txt
 
-# Deteccion y tracking
+# Para la Deteccion y tracking
 ultralytics==8.4.176
 lap==0.5.13
 
-# Procesamiento de video
+# Para el Procesamiento de video
 opencv-python==5.0.0.93
 
 # PyTorch (version CPU en Windows)
