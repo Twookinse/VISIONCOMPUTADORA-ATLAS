@@ -12,6 +12,7 @@ Ejecucion local:
     Documentacion Swagger: http://localhost:8000/docs
 """
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Optional, List
 
 import cv2
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -224,6 +225,57 @@ def list_runs(db: Session = Depends(get_db)):
         "total": len(runs),
         "corridas": [r.to_dict() for r in runs],
     }
+
+
+@app.get("/api/cameras")
+def list_cameras(db: Session = Depends(get_db)):
+    """Devuelve el estado de las camaras configuradas para el Dashboard (Tarea 5.6)."""
+    last_run = db.query(PipelineRun).order_by(PipelineRun.id.desc()).first()
+    zones_path = PROJECT_ROOT / "config/zones/casa_cocina.json"
+    model_path = PROJECT_ROOT / "models/custom/jarras_nex_v1.pt"
+    return {
+        "camaras": [
+            {
+                "id": "cam-cocina-01",
+                "nombre": "Camara 1 - Mesa de Cocina (Nex)",
+                "estado": "activa",
+                "zona_roi": "Mesa de cocina" if zones_path.exists() else "Sin configurar",
+                "modelo": "jarras_nex_v1.pt (Custom)" if model_path.exists() else "yolo26n.pt",
+                "ultima_actividad": last_run.created_at.isoformat() if last_run and last_run.created_at else None,
+                "fuente_actual": last_run.source if last_run else "videos/VIDEO 2 VISION COMPUTADORA.mp4",
+            }
+        ]
+    }
+
+
+@app.websocket("/ws/events")
+async def websocket_events(websocket: WebSocket):
+    """Canal WebSocket para enviar actualizaciones en vivo al Dashboard (Tarea 5.7)."""
+    await websocket.accept()
+    last_seen_id = -1
+    try:
+        while True:
+            session_local = create_session_factory()
+            db = session_local()
+            try:
+                latest = db.query(KitchenEvent).order_by(KitchenEvent.id.desc()).first()
+                total_events = db.query(KitchenEvent).count()
+                current_id = latest.id if latest else 0
+                if current_id != last_seen_id:
+                    last_seen_id = current_id
+                    await websocket.send_json({
+                        "type": "sync",
+                        "total_events": total_events,
+                        "latest_event": latest.to_dict() if latest else None,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+            finally:
+                db.close()
+            await asyncio.sleep(3)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 @app.post("/api/pipeline/run")

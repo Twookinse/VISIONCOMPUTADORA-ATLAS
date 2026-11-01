@@ -32,6 +32,9 @@ notebooks/
 .vscode/
 .idea/
 
-# Sistema
+# Sistema y Node (Dashboard React)
 .DS_Store
 Thumbs.db
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
