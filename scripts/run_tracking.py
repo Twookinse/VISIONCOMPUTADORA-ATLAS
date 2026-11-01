@@ -36,8 +36,8 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        default="models/pretrained/yolo26n.pt",
-        help="Ruta al modelo YOLO (default: models/pretrained/yolo26n.pt)",
+        default="models/custom/jarras_nex_v1.pt",
+        help="Ruta al modelo YOLO (default: models/custom/jarras_nex_v1.pt)",
     )
     parser.add_argument(
         "--confidence",

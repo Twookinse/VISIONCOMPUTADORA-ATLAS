@@ -34,14 +34,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Contar jarras levantadas")
     parser.add_argument("--source", required=True,
                         help="Video, 0 para camara web, o URL RTSP")
-    parser.add_argument("--model", default="models/pretrained/yolo26n.pt",
-                        help="Modelo YOLO (default: models/pretrained/yolo26n.pt)")
+    parser.add_argument("--model", default="models/custom/jarras_nex_v1.pt",
+                        help="Modelo YOLO (default: models/custom/jarras_nex_v1.pt)")
     parser.add_argument("--zones", default="config/zones/casa_cocina.json",
                         help="Archivo de zonas (default: config/zones/casa_cocina.json)")
     parser.add_argument("--tracker", default="config/trackers/bytetrack_cocina.yaml",
                         help="Configuracion del tracker (default: config/trackers/bytetrack_cocina.yaml)")
     parser.add_argument("--classes", nargs="+", default=DEFAULT_JAR_CLASSES,
-                        help=f"Clases que cuentan como jarra (default: {' '.join(DEFAULT_JAR_CLASSES)})")
+                        help="Clases movibles a monitorear en las zonas")
     parser.add_argument("--confidence", type=float, default=0.25,
                         help="Confianza minima de deteccion (default: 0.25)")
     parser.add_argument("--min-frames", type=int, default=3,
@@ -83,8 +83,9 @@ def main():
     is_file = total_frames > 0
 
     print(f"Fuente: {args.source}")
+    print(f"Modelo: {args.model}")
     print(f"Zonas usadas: {[z.name for z in analyzer.zones]}")
-    print(f"Clases consideradas jarra: {sorted(analyzer.jar_classes)}")
+    print(f"Clases monitoreadas: {sorted(analyzer.jar_classes)}")
     print()
 
     writer = None
@@ -115,8 +116,8 @@ def main():
             new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
 
             for event in new_events:
-                action = "LEVANTADA" if event.event_type == "salida" else "DEVUELTA"
-                last_event_text = f"Jarra #{event.track_id} {action}"
+                action = "LEVANTADO/A" if event.event_type == "salida" else "DEVUELTO/A"
+                last_event_text = f"{event.class_name} #{event.track_id} {action}"
                 last_event_frame = frame_count
                 print(f"  [{event.time_s:6.1f}s] {event.class_name} #{event.track_id} "
                       f"{event.event_type} de '{event.zone}'")
@@ -124,9 +125,10 @@ def main():
             # Dibujar objetos, zonas y contador
             annotated = draw_zones(results.plot(), analyzer.zones)
             cv2.rectangle(annotated, (0, 0), (width, 34), (0, 0, 0), -1)
-            cv2.putText(annotated,
-                        f"Levantadas: {analyzer.lifted}  Devueltas: {analyzer.returned}",
-                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            hud_text = (f"Jarras Lev: {analyzer.lifted} Dev: {analyzer.returned} | "
+                        f"Total Objetos Lev: {analyzer.total_lifted}")
+            cv2.putText(annotated, hud_text,
+                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
             # Mostrar el ultimo evento durante ~1.5 segundos
             if frame_count - last_event_frame < fps * 1.5:
                 cv2.putText(annotated, last_event_text, (10, 64),
@@ -164,8 +166,14 @@ def main():
             json.dump(report, f, indent=2, ensure_ascii=False)
 
         print()
-        print(f"Se detectaron {analyzer.lifted} jarras levantadas "
-              f"y {analyzer.returned} devueltas")
+        print(f"Jarras: {analyzer.lifted} levantadas y {analyzer.returned} devueltas")
+        print(f"Total objetos de cocina: {analyzer.total_lifted} levantados "
+              f"y {analyzer.total_returned} devueltos")
+        by_class = analyzer.counts_by_class()
+        if by_class:
+            print("Desglose por clase:")
+            for cls_name, c in sorted(by_class.items()):
+                print(f"  - {cls_name}: {c['levantados']} levantados, {c['devueltos']} devueltos")
         print(f"Reporte: {report_path}")
         if writer:
             print(f"Video:   {video_path}")
