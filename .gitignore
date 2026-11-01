@@ -7,9 +7,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Modelos YOLO (archivos pesados)
+# Modelos YOLO y bases de datos locales
 *.pt
 *.onnx
+*.db
 
 # Videos (archivos pesados)
 videos/*.mp4

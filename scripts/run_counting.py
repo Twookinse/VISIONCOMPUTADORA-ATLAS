@@ -28,6 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.detection.tracker import Tracker
 from src.events.zones import load_zones, draw_zones
 from src.analysis.kitchen import KitchenAnalyzer, DEFAULT_JAR_CLASSES
+from src.db.models import save_report_to_db
 
 
 def parse_args():
@@ -165,6 +166,8 @@ def main():
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
+        run_id = save_report_to_db(report)
+
         print()
         print(f"Jarras: {analyzer.lifted} levantadas y {analyzer.returned} devueltas")
         print(f"Total objetos de cocina: {analyzer.total_lifted} levantados "
@@ -175,6 +178,7 @@ def main():
             for cls_name, c in sorted(by_class.items()):
                 print(f"  - {cls_name}: {c['levantados']} levantados, {c['devueltos']} devueltos")
         print(f"Reporte: {report_path}")
+        print(f"Guardado en BD SQLite (corrida #{run_id})")
         if writer:
             print(f"Video:   {video_path}")
 
