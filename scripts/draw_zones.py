@@ -9,6 +9,8 @@ Uso:
 Controles en la ventana:
     Clic izquierdo   Agregar un punto a la zona actual
     Enter            Cerrar la zona actual (pide el nombre en la terminal)
+    N                Adelantar el video (~2 segundos) para ver mejor el fondo
+    B                Retroceder el video (~2 segundos)
     Z                Deshacer el ultimo punto
     D                Borrar la ultima zona
     S                Guardar manualmente (no es necesario, se guarda solo)
@@ -40,8 +42,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Dibujar zonas ROI sobre un frame")
     parser.add_argument("--source", required=True,
                         help="Video, 0 para camara web, o URL RTSP")
-    parser.add_argument("--frame", type=int, default=0,
-                        help="Numero de frame a usar como fondo (default: 0)")
+    parser.add_argument("--frame", type=int, default=300,
+                        help="Numero de frame a usar como fondo (default: 300, salta el logo inicial)")
     parser.add_argument("--zones", default="config/zones/casa_cocina.json",
                         help="Archivo JSON de zonas (default: config/zones/casa_cocina.json)")
     return parser.parse_args()
@@ -64,7 +66,11 @@ def main():
     source = int(args.source) if args.source.isdigit() else args.source
     zones_path = PROJECT_ROOT / args.zones
 
-    background = read_background(source, args.frame)
+    frame_num = args.frame
+    background = read_background(source, frame_num)
+    if background is None:
+        frame_num = 0
+        background = read_background(source, 0)
     if background is None:
         print(f"Error: no se pudo leer un frame de '{args.source}'")
         sys.exit(1)
@@ -73,14 +79,18 @@ def main():
     zones = load_zones(zones_path)
     current_points = []  # puntos en pixeles de la zona que se esta dibujando
 
+    print(f"Resolucion real del video: {width}x{height} (mostrando frame #{frame_num})")
     print(f"Zonas cargadas: {len(zones)} desde {args.zones}")
-    print("Clic: punto | Enter: cerrar zona | Z: deshacer | D: borrar zona | S: guardar | Q: salir")
+    print("Clic: punto | Enter: cerrar zona | N/B: adelantar/atrasar video | Z: deshacer | D: borrar zona | Q: salir")
 
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             current_points.append((x, y))
 
-    cv2.namedWindow(WINDOW_NAME)
+    # WINDOW_NORMAL permite redimensionar la ventana a 1280x720 para que un video
+    # 1920x1080 se vea completo en pantalla sin recortarse ni verse con zoom.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 1280, 720)
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
     while True:
@@ -92,8 +102,8 @@ def main():
             if i > 0:
                 cv2.line(view, current_points[i - 1], point, (0, 255, 0), 2)
 
-        cv2.putText(view, f"Zonas: {len(zones)} | Puntos actuales: {len(current_points)}",
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(view, f"Frame: {frame_num} (N:+2s / B:-2s) | Zonas: {len(zones)} | Puntos: {len(current_points)}",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
         cv2.imshow(WINDOW_NAME, view)
         key = cv2.waitKey(30) & 0xFF
 
@@ -101,7 +111,22 @@ def main():
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
 
-        if key == 13:  # Enter
+        if key == ord("n"):
+            next_bg = read_background(source, frame_num + 120)
+            if next_bg is not None:
+                frame_num += 120
+                background = next_bg
+                print(f"Frame adelantado a #{frame_num}")
+
+        elif key == ord("b"):
+            prev_frame = max(0, frame_num - 120)
+            prev_bg = read_background(source, prev_frame)
+            if prev_bg is not None:
+                frame_num = prev_frame
+                background = prev_bg
+                print(f"Frame retrocedido a #{frame_num}")
+
+        elif key == 13:  # Enter
             if len(current_points) < 3:
                 print("Una zona necesita al menos 3 puntos")
                 continue
