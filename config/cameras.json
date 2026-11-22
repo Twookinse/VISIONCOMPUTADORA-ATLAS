@@ -1,0 +1,39 @@
+{
+  "descripcion": "Configuracion central de las camaras del karaoke Nex. Al llevar el sistema al local, solo pega el enlace rtsp_url de cada camara (o guardalo desde el Dashboard).",
+  "modelo_default": "models/custom/jarras_nex_v1.pt",
+  "camaras": [
+    {
+      "id": "cocina_1",
+      "nombre": "Cocina 1 - Mesa Central",
+      "ubicacion": "Area de preparacion principal",
+      "zones_file": "config/zones/cocina_1.json",
+      "rtsp_url": "",
+      "default_video": "videos/COCINA 1 VIDEO 1.mp4",
+      "video_prefix": "COCINA 1",
+      "resolucion_esperada": "720p @ 1000 KB/s (grabaciones 1080p 60fps)",
+      "activa": true
+    },
+    {
+      "id": "cocina_2",
+      "nombre": "Cocina 2 - Vista Panoramica",
+      "ubicacion": "Vista general de cocina, congelador y estante",
+      "zones_file": "config/zones/cocina_2.json",
+      "rtsp_url": "",
+      "default_video": "videos/COCINA 2 VIDEO 1.mp4",
+      "video_prefix": "COCINA 2",
+      "resolucion_esperada": "720p @ 1000 KB/s (grabaciones 1080p 60fps)",
+      "activa": true
+    },
+    {
+      "id": "almacen",
+      "nombre": "Almacen - Insumos y Refrigeradores",
+      "ubicacion": "Despensa contigua a la cocina",
+      "zones_file": "config/zones/almacen.json",
+      "rtsp_url": "",
+      "default_video": "videos/ALMACEN VIDEO 1.mp4",
+      "video_prefix": "ALMACEN",
+      "resolucion_esperada": "720p @ 1000 KB/s (grabaciones 1080p 60fps)",
+      "activa": true
+    }
+  ]
+}

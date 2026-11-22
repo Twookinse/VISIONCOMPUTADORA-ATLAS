@@ -1,10 +1,10 @@
 """
-Modelos de tablas SQLAlchemy para almacenar corridas de video y eventos.
+Modelos de tablas SQLAlchemy para almacenar corridas de video y eventos por camara.
 
-- PipelineRun: guarda la metadata de cada ejecucion del pipeline (video, modelo,
+- PipelineRun: metadata de cada ejecucion del pipeline (camara, video, modelo,
   fecha/hora, totales de jarras y objetos levantados/devueltos).
-- KitchenEvent: guarda cada evento individual (salida/levantado o entrada/devuelto
-  de cualquier objeto de cocina como Jarra, Vaso, Plato, Olla, etc.).
+- KitchenEvent: cada evento individual (salida/levantado o entrada/devuelto
+  de cualquier objeto movible de cocina: Jarra, Taper, Olla, Vaso, etc.).
 """
 
 from datetime import datetime
@@ -12,6 +12,7 @@ from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 
 from src.db.database import Base, create_session_factory
+from src.config.cameras import detect_camera_for_source
 
 
 class PipelineRun(Base):
@@ -20,6 +21,7 @@ class PipelineRun(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.now, index=True)
+    camera_id = Column(String, nullable=False, default="cocina_1", index=True)
     source = Column(String, nullable=False)
     model = Column(String, nullable=False)
     zones_file = Column(String, nullable=False)
@@ -41,6 +43,7 @@ class PipelineRun(Base):
         return {
             "id": self.id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "camera_id": self.camera_id or "cocina_1",
             "source": self.source,
             "model": self.model,
             "zones_file": self.zones_file,
@@ -55,12 +58,13 @@ class PipelineRun(Base):
 
 
 class KitchenEvent(Base):
-    """Evento individual detectado en una zona de la cocina."""
+    """Evento individual detectado en una zona ROI de una camara."""
     __tablename__ = "kitchen_events"
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("pipeline_runs.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.now, index=True)
+    camera_id = Column(String, nullable=False, default="cocina_1", index=True)
     source = Column(String, nullable=False, default="")
     frame = Column(Integer, nullable=False)
     time_s = Column(Float, nullable=False)
@@ -76,6 +80,7 @@ class KitchenEvent(Base):
             "id": self.id,
             "run_id": self.run_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "camera_id": self.camera_id or "cocina_1",
             "source": self.source,
             "frame": self.frame,
             "time_s": self.time_s,
@@ -97,9 +102,16 @@ def save_report_to_db(report, db_path=None, created_at=None):
     db = session_local()
     try:
         base_time = created_at or datetime.now()
+        source = report.get("fuente", "")
+        cam_id = report.get("camera_id")
+        if not cam_id:
+            detected = detect_camera_for_source(source)
+            cam_id = detected["id"] if detected else "cocina_1"
+
         run = PipelineRun(
             created_at=base_time,
-            source=report.get("fuente", ""),
+            camera_id=cam_id,
+            source=source,
             model=report.get("modelo", ""),
             zones_file=report.get("zonas_archivo", ""),
             frames_processed=report.get("frames_procesados", 0),
@@ -121,6 +133,7 @@ def save_report_to_db(report, db_path=None, created_at=None):
             db.add(KitchenEvent(
                 run_id=run.id,
                 created_at=base_time,
+                camera_id=cam_id,
                 source=run.source,
                 frame=ev["frame"],
                 time_s=ev["time_s"],

@@ -104,6 +104,169 @@ code {
   border-color: #f93e3e;
 }
 
+.camera-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.cam-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  padding: 0.48rem 0.9rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.cam-tab.active {
+  background: #3b4151;
+  color: #ffffff;
+  border-color: #3b4151;
+}
+
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #cbd5e1;
+}
+
+.tab-dot.live {
+  background: #49cc90;
+}
+
+.progress-panel {
+  margin-top: 0.9rem;
+  padding: 0.8rem 1rem;
+  background: rgba(97, 175, 254, 0.08);
+  border: 1px solid #61affe;
+  border-radius: 4px;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.86rem;
+}
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #49cc90;
+  transition: width 0.4s ease;
+}
+
+.live-quick-switch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.btn-mini {
+  background: #fff;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 3px;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn-mini.active {
+  background: #49cc90;
+  color: #fff;
+  border-color: #49cc90;
+}
+
+.cameras-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.camera-card.selected-cam {
+  border-color: #61affe;
+  border-left: 4px solid #61affe;
+}
+
+.cam-card-actions {
+  display: flex;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+}
+
+.cam-status.live {
+  background: rgba(73, 204, 144, 0.2);
+  color: #166534;
+  border: 1px solid #49cc90;
+}
+
+.cam-status.video {
+  background: rgba(97, 175, 254, 0.15);
+  color: #1d4ed8;
+  border: 1px solid #61affe;
+}
+
+.muted-sm {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.zones-summary {
+  margin-top: 1.1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--panel-border);
+}
+
+.zones-summary h3 {
+  font-size: 0.88rem;
+  margin-bottom: 0.4rem;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.zone-chip {
+  font-family: Consolas, Monaco, 'Courier New', monospace;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 3px;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.76rem;
+}
+
+.cam-chip {
+  font-family: Consolas, Monaco, 'Courier New', monospace;
+  background: var(--panel-alt);
+  border: 1px solid var(--panel-border);
+  padding: 0.15rem 0.45rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);

@@ -13,42 +13,40 @@ const SHIFTS = {
   noche: { label: 'Turno Noche Karaoke (21:00 - 04:59)', check: (h) => h >= 21 || h < 5 },
 }
 
-const KNOWN_CLASSES = [
-  'Jarra',
-  'Vaso',
-  'Plato',
-  'Olla',
-  'Cuchillo',
-  'Tijera',
-  'Pinia',
-  'Envase de cafe',
-  'Envase de sal',
-  'Trapo',
-  'Papel Higienico',
-]
+const CAMERA_LABELS = {
+  cocina_1: 'Cocina 1',
+  cocina_2: 'Cocina 2',
+  almacen: 'Almacen',
+}
 
 export default function App() {
   const [events, setEvents] = useState([])
   const [hourly, setHourly] = useState([])
   const [totalsByClass, setTotalsByClass] = useState({})
+  const [totalsByZone, setTotalsByZone] = useState({})
   const [cameras, setCameras] = useState([])
-  const [availableVideos, setAvailableVideos] = useState([])
+  const [availableClasses, setAvailableClasses] = useState([])
+  const [videosDetail, setVideosDetail] = useState([])
   const [liveStatus, setLiveStatus] = useState({ activo: false })
+  const [jobStatus, setJobStatus] = useState({ activo: false, progreso_pct: 0 })
   const [wsConnected, setWsConnected] = useState(false)
   const [apiOnline, setApiOnline] = useState(false)
   const [loading, setLoading] = useState(true)
 
-  // Controles de camara y carga de videos
-  const [liveSource, setLiveSource] = useState('0')
-  const [selectedVideo, setSelectedVideo] = useState('videos/VIDEO 2 VISION COMPUTADORA.mp4')
-  const [processingVideo, setProcessingVideo] = useState(false)
+  // Camara activa para filtros y operacion ("" = todas)
+  const [cameraFilter, setCameraFilter] = useState('')
+  const [activeCamId, setActiveCamId] = useState('cocina_1')
+
+  // Controles de video y RTSP
+  const [selectedVideo, setSelectedVideo] = useState('')
+  const [rtspDraft, setRtspDraft] = useState('')
   const [uploadingVideo, setUploadingVideo] = useState(false)
   const [actionMsg, setActionMsg] = useState('')
   const [lastReport, setLastReport] = useState(null)
   const [streamKey, setStreamKey] = useState(1)
   const fileInputRef = useRef(null)
 
-  // Filtros
+  // Filtros adicionales
   const [dateFilter, setDateFilter] = useState('')
   const [shiftFilter, setShiftFilter] = useState('todos')
   const [classFilter, setClassFilter] = useState('')
@@ -56,15 +54,18 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const params = new URLSearchParams()
+      if (cameraFilter) params.set('camera_id', cameraFilter)
       if (dateFilter) params.set('date', dateFilter)
       if (classFilter) params.set('class_name', classFilter)
 
-      const [evRes, hrRes, camRes, vidRes, liveRes] = await Promise.all([
+      const [evRes, hrRes, camRes, vidRes, liveRes, jobRes, clsRes] = await Promise.all([
         fetch(`${API_BASE}/api/events?${params.toString()}`),
         fetch(`${API_BASE}/api/metrics/hourly?${params.toString()}`),
         fetch(`${API_BASE}/api/cameras`),
         fetch(`${API_BASE}/api/videos`),
         fetch(`${API_BASE}/api/live/status`),
+        fetch(`${API_BASE}/api/pipeline/status`),
+        fetch(`${API_BASE}/api/classes`),
       ])
 
       if (evRes.ok && hrRes.ok) {
@@ -73,36 +74,57 @@ export default function App() {
         setEvents(evData.eventos || [])
         setHourly(hrData.por_hora || [])
         setTotalsByClass(hrData.totales_por_clase || {})
+        setTotalsByZone(hrData.totales_por_zona || {})
         setApiOnline(true)
       }
       if (camRes.ok) {
         const camData = await camRes.json()
-        setCameras(camData.camaras || [])
+        const cams = camData.camaras || []
+        setCameras(cams)
       }
       if (vidRes.ok) {
         const vidData = await vidRes.json()
-        const vids = vidData.videos || []
-        setAvailableVideos(vids)
-        if (vids.length > 0 && !selectedVideo) {
-          setSelectedVideo(vids[0])
+        const details = vidData.detalle || []
+        setVideosDetail(details)
+        if (details.length > 0 && !selectedVideo) {
+          setSelectedVideo(details[0].path)
         }
       }
       if (liveRes.ok) {
-        const lData = await liveRes.json()
-        setLiveStatus(lData)
+        setLiveStatus(await liveRes.json())
+      }
+      if (jobRes.ok) {
+        const jData = await jobRes.json()
+        setJobStatus(jData)
+        if (!jData.activo && jData.ultimo_reporte) {
+          setLastReport(jData.ultimo_reporte)
+        }
+      }
+      if (clsRes.ok) {
+        const cData = await clsRes.json()
+        setAvailableClasses(cData.clases || [])
       }
     } catch (err) {
       setApiOnline(false)
     } finally {
       setLoading(false)
     }
-  }, [dateFilter, classFilter, selectedVideo])
+  }, [cameraFilter, dateFilter, classFilter, selectedVideo])
+
+  // Sincronizar borrador RTSP y video sugerido cuando cambia la camara activa
+  useEffect(() => {
+    const cam = cameras.find((c) => c.id === activeCamId)
+    if (cam) {
+      setRtspDraft(cam.rtsp_url || '')
+    }
+  }, [activeCamId, cameras])
 
   useEffect(() => {
     fetchData()
-    const timer = setInterval(fetchData, 5000)
+    const intervalMs = jobStatus.activo ? 1500 : 4000
+    const timer = setInterval(fetchData, intervalMs)
     return () => clearInterval(timer)
-  }, [fetchData])
+  }, [fetchData, jobStatus.activo])
 
   useEffect(() => {
     let ws
@@ -130,19 +152,66 @@ export default function App() {
     }
   }, [fetchData])
 
-  const handleStartLive = async (sourceToUse) => {
-    setActionMsg(`Abriendo reproduccion con marcas: "${sourceToUse}"...`)
-    setLiveStatus({ activo: true, fuente: sourceToUse, resolucion: 'Cargando...' })
+  const handleSelectCameraTab = (camId) => {
+    setCameraFilter(camId)
+    if (camId) {
+      setActiveCamId(camId)
+      const camVideo = videosDetail.find((v) => v.camera_id === camId)
+      if (camVideo) {
+        setSelectedVideo(camVideo.path)
+      }
+    }
+  }
+
+  const handleVideoDropdownChange = (vidPath) => {
+    setSelectedVideo(vidPath)
+    const info = videosDetail.find((v) => v.path === vidPath)
+    if (info && info.camera_id) {
+      setActiveCamId(info.camera_id)
+    }
+  }
+
+  const handleSaveRtsp = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/cameras/${activeCamId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rtsp_url: rtspDraft }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setActionMsg(data.mensaje)
+        fetchData()
+      } else {
+        setActionMsg('No se pudo guardar el enlace RTSP.')
+      }
+    } catch (e) {
+      setActionMsg('Error al guardar el enlace RTSP.')
+    }
+  }
+
+  const handleStartLive = async (sourceToUse, camIdOverride = null) => {
+    const targetCam = camIdOverride || activeCamId
+    const src = (sourceToUse || '').trim()
+    if (!src) {
+      setActionMsg(
+        `Aun no hay enlace RTSP configurado para ${CAMERA_LABELS[targetCam] || targetCam}. Usa "Reproducir con Marcas" con un video o pega el enlace RTSP cuando estes en el local.`
+      )
+      return
+    }
+    setActiveCamId(targetCam)
+    setActionMsg(`Abriendo vista con marcas para ${CAMERA_LABELS[targetCam] || targetCam}: "${src}"...`)
+    setLiveStatus({ activo: true, camera_id: targetCam, fuente: src, resolucion: 'Cargando...' })
     setStreamKey(Date.now())
     try {
       const res = await fetch(`${API_BASE}/api/live/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: sourceToUse }),
+        body: JSON.stringify({ source: src, camera_id: targetCam }),
       })
       const data = await res.json()
-      setLiveStatus(data.estado || { activo: true, fuente: sourceToUse })
-      setActionMsg(`Reproduciendo con marcas en vivo: ${sourceToUse}`)
+      setLiveStatus(data.estado || { activo: true, camera_id: targetCam, fuente: src })
+      setActionMsg(`Transmitiendo con marcas [${CAMERA_LABELS[targetCam] || targetCam}]: ${src}`)
     } catch (e) {
       setActionMsg('No se pudo iniciar la transmision en vivo.')
       setLiveStatus({ activo: false })
@@ -154,37 +223,49 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/live/stop`, { method: 'POST' })
       const data = await res.json()
       setLiveStatus(data.estado || { activo: false })
-      setActionMsg('Transmision detenida.')
+      setActionMsg('Vista en directo detenida.')
       fetchData()
     } catch (e) {
-      setActionMsg('Error al detener la transmision.')
+      setActionMsg('Error al detener la vista en directo.')
     }
   }
 
-  const runVideoAnalysis = async (videoPath) => {
-    setProcessingVideo(true)
+  const startBackgroundAnalysis = async (videoPath, camIdOverride = null) => {
+    if (!videoPath) return
+    const info = videosDetail.find((v) => v.path === videoPath)
+    const targetCam = camIdOverride || (info ? info.camera_id : activeCamId)
     setLastReport(null)
-    setActionMsg(`Analizando grabacion "${videoPath}"... Esto puede tardar cerca de 1 minuto.`)
+    setActionMsg(
+      `Iniciando conteo de "${videoPath.replace('videos/', '')}" con las zonas de ${CAMERA_LABELS[targetCam] || targetCam}...`
+    )
     try {
-      const res = await fetch(`${API_BASE}/api/pipeline/run`, {
+      const res = await fetch(`${API_BASE}/api/pipeline/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: videoPath }),
+        body: JSON.stringify({
+          source: videoPath,
+          camera_id: targetCam,
+          skip_frames: 0,
+        }),
       })
       if (res.ok) {
         const data = await res.json()
-        setLastReport(data.reporte)
-        setActionMsg(
-          `Revision completada: Se detectaron ${data.reporte.jarras_levantadas} jarras levantadas y ${data.reporte.objetos_levantados_total} movimientos totales.`
-        )
-        fetchData()
+        setJobStatus(data.estado)
       } else {
-        setActionMsg('No se pudo analizar el video seleccionado.')
+        const err = await res.json().catch(() => ({}))
+        setActionMsg(err.detail || 'No se pudo iniciar el analisis del video.')
       }
     } catch (e) {
       setActionMsg('Error de comunicacion con el servidor.')
-    } finally {
-      setProcessingVideo(false)
+    }
+  }
+
+  const handleCancelJob = async () => {
+    try {
+      await fetch(`${API_BASE}/api/pipeline/cancel`, { method: 'POST' })
+      setActionMsg('Deteniendo analisis y guardando los eventos encontrados hasta ahora...')
+    } catch (e) {
+      setActionMsg('No se pudo cancelar el analisis.')
     }
   }
 
@@ -211,11 +292,12 @@ export default function App() {
 
       const upData = await upRes.json()
       const newVideoPath = upData.video_path
+      const detectedCam = upData.camera_id || activeCamId
       setSelectedVideo(newVideoPath)
+      setActiveCamId(detectedCam)
       setUploadingVideo(false)
 
-      // Una vez subido, lo analiza automaticamente
-      await runVideoAnalysis(newVideoPath)
+      await startBackgroundAnalysis(newVideoPath, detectedCam)
     } catch (err) {
       setActionMsg('Error al subir el video desde la computadora.')
       setUploadingVideo(false)
@@ -247,12 +329,13 @@ export default function App() {
     let objLev = 0
     let objDev = 0
     for (const ev of filteredEvents) {
+      const isJar = ev.class_name === 'Jarra' || ev.class_name === 'Jarra Licuadora'
       if (ev.event_type === 'salida') {
         objLev += 1
-        if (ev.class_name === 'Jarra') jarrasLev += 1
+        if (isJar) jarrasLev += 1
       } else {
         objDev += 1
-        if (ev.class_name === 'Jarra') jarrasDev += 1
+        if (isJar) jarrasDev += 1
       }
     }
     return { jarrasLev, jarrasDev, objLev, objDev }
@@ -265,36 +348,65 @@ export default function App() {
     return Math.max(1, ...vals)
   }, [filteredHourly])
 
+  const activeCameraObj = cameras.find((c) => c.id === activeCamId)
+
   return (
     <div className="dashboard">
       <header className="topbar">
         <div>
-          <h1>Bitacora de Cocina — Karaoke Nex</h1>
+          <h1>Nex Vision — Control Multi-Camara de Cocina</h1>
           <p className="subtitle">
-            Registro de salida de jarras, vasos y platos en mesa de despacho (La Paz)
+            Monitoreo de jarras, utensilios e insumos en Cocina 1, Cocina 2 y Almacen (La Paz)
           </p>
         </div>
         <div className="status-badges">
           <span className={`badge ${apiOnline ? 'online' : 'offline'}`}>
-            Sistema: {apiOnline ? 'En linea' : 'Desconectado'}
+            API: {apiOnline ? 'EN LINEA' : 'OFFLINE'}
           </span>
           <span className={`badge ${wsConnected ? 'online' : 'warn'}`}>
-            Sincronizacion: {wsConnected ? 'Automatica' : 'Manual'}
+            WS: {wsConnected ? 'ACTIVO' : 'ESPERA'}
           </span>
           <span className={`badge ${liveStatus.activo ? 'online' : 'warn'}`}>
-            Camara: {liveStatus.activo ? `Transmitiendo (${liveStatus.fps || 0} fps)` : 'En pausa'}
+            CAMARA:{' '}
+            {liveStatus.activo
+              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} (${liveStatus.fps || 0} fps)`
+              : 'EN PAUSA'}
           </span>
         </div>
       </header>
 
-      {/* SECCION DE OPERACION: SUBIR VIDEO O CONECTAR CAMARA */}
+      {/* SELECTOR RAPIDO DE CAMARAS (COCINA 1 / COCINA 2 / ALMACEN) */}
+      <nav className="camera-tabs">
+        <button
+          className={`cam-tab ${cameraFilter === '' ? 'active' : ''}`}
+          onClick={() => handleSelectCameraTab('')}
+        >
+          Todas las Camaras ({cameras.length})
+        </button>
+        {cameras.map((cam) => {
+          const isLive = liveStatus.activo && liveStatus.camera_id === cam.id
+          return (
+            <button
+              key={cam.id}
+              className={`cam-tab ${cameraFilter === cam.id ? 'active' : ''}`}
+              onClick={() => handleSelectCameraTab(cam.id)}
+            >
+              <span>{cam.nombre}</span>
+              <span className={`tab-dot ${isLive ? 'live' : ''}`} />
+            </button>
+          )
+        })}
+      </nav>
+
+      {/* CENTRO DE CONTROL: GRABACIONES + CONFIGURACION RTSP POR CAMARA */}
       <section className="panel control-center">
         <div className="control-grid">
-          {/* Bloque 1: Revisar grabacion (subir video o elegir existente) */}
+          {/* Bloque 1: Grabaciones de Nex o subir video */}
           <div className="control-box">
-            <h2>Revisar Grabacion de Cocina (Ej. Video de ayer)</h2>
+            <h2>1. Revisar Grabacion de Camaras Nex</h2>
             <p className="helper-text">
-              Puedes subir cualquier video desde tu computadora para contar cuantas jarras y objetos se levantaron, o elegir uno ya guardado.
+              Selecciona una grabacion o sube un video nuevo. El sistema asigna automaticamente las zonas ROI de{' '}
+              <code>{CAMERA_LABELS[activeCamId] || activeCamId}</code>.
             </p>
 
             <div className="upload-row">
@@ -307,85 +419,147 @@ export default function App() {
               />
               <button
                 className="btn-primary"
-                disabled={uploadingVideo || processingVideo}
+                disabled={uploadingVideo || jobStatus.activo}
                 onClick={() => fileInputRef.current && fileInputRef.current.click()}
               >
-                {uploadingVideo
-                  ? 'Subiendo video...'
-                  : 'Subir video de mi PC y Contar'}
+                {uploadingVideo ? 'Subiendo video...' : 'Subir video de mi PC y Contar'}
               </button>
-              <span className="or-divider">o elegir guardado:</span>
+              <span className="or-divider">o elegir grabacion local:</span>
             </div>
 
             <div className="control-row">
               <select
                 value={selectedVideo}
-                onChange={(e) => setSelectedVideo(e.target.value)}
+                onChange={(e) => handleVideoDropdownChange(e.target.value)}
               >
-                {availableVideos.map((v) => (
-                  <option key={v} value={v}>
-                    {v.replace('videos/', '')}
+                {videosDetail.map((v) => (
+                  <option key={v.path} value={v.path}>
+                    [{CAMERA_LABELS[v.camera_id] || v.camera_id}] {v.name}
                   </option>
                 ))}
               </select>
               <button
                 className="btn-secondary"
-                disabled={processingVideo || uploadingVideo}
-                onClick={() => runVideoAnalysis(selectedVideo)}
+                disabled={jobStatus.activo || uploadingVideo || !selectedVideo}
+                onClick={() => startBackgroundAnalysis(selectedVideo)}
               >
-                {processingVideo ? 'Contando...' : 'Contar Video'}
+                {jobStatus.activo ? 'Analizando...' : 'Contar Video'}
               </button>
               <button
                 className="btn-outline"
-                onClick={() => handleStartLive(selectedVideo)}
+                disabled={!selectedVideo}
+                onClick={() => {
+                  const info = videosDetail.find((v) => v.path === selectedVideo)
+                  handleStartLive(selectedVideo, info ? info.camera_id : activeCamId)
+                }}
               >
                 Reproducir con Marcas
               </button>
             </div>
           </div>
 
-          {/* Bloque 2: Camara en tiempo real */}
+          {/* Bloque 2: Cambio de camara y configuracion RTSP lista para el local */}
           <div className="control-box">
-            <h2>Camara de Cocina en Tiempo Real (720p)</h2>
+            <h2>2. Camaras en Tiempo Real (Listo para RTSP en Local)</h2>
             <p className="helper-text">
-              Para conectar la camara del local en vivo escribe su direccion RTSP (720p @ 1000 KB/s) o <code>0</code> para camara USB.
+              Elige la camara de Nex. Cuando instales el sistema en el local, pega su enlace <code>rtsp://...</code> y presiona Guardar RTSP.
             </p>
+
+            <div className="control-row" style={{ marginBottom: '0.55rem' }}>
+              <select
+                value={activeCamId}
+                onChange={(e) => setActiveCamId(e.target.value)}
+              >
+                {cameras.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.nombre} ({c.zona_roi})
+                  </option>
+                ))}
+              </select>
+              <button
+                className="btn-outline"
+                onClick={() => {
+                  const cam = cameras.find((c) => c.id === activeCamId)
+                  const src = (cam && cam.default_video) || selectedVideo
+                  handleStartLive(src, activeCamId)
+                }}
+              >
+                Probar Vista {CAMERA_LABELS[activeCamId] || activeCamId}
+              </button>
+            </div>
+
             <div className="control-row">
               <input
                 type="text"
-                value={liveSource}
-                onChange={(e) => setLiveSource(e.target.value)}
-                placeholder="0 o rtsp://usuario:clave@192.168.1.50:554/stream"
+                value={rtspDraft}
+                onChange={(e) => setRtspDraft(e.target.value)}
+                placeholder="rtsp://usuario:clave@IP_DVR:554/stream (o 0 para USB)"
               />
+              <button className="btn-secondary" onClick={handleSaveRtsp}>
+                Guardar RTSP
+              </button>
               {!liveStatus.activo ? (
                 <button
                   className="btn-primary"
-                  onClick={() => handleStartLive(liveSource)}
+                  onClick={() => handleStartLive(rtspDraft, activeCamId)}
                 >
-                  Encender Vista en Vivo
+                  Conectar en Vivo
                 </button>
               ) : (
                 <button className="btn-danger" onClick={handleStopLive}>
-                  Detener Camara
+                  Detener Vista
                 </button>
               )}
             </div>
           </div>
         </div>
 
+        {/* Barra de progreso del analisis de video largo */}
+        {jobStatus.activo && (
+          <div className="progress-panel">
+            <div className="progress-header">
+              <strong>
+                Analizando [{CAMERA_LABELS[jobStatus.camera_id] || jobStatus.camera_id}]{' '}
+                {jobStatus.fuente.replace('videos/', '')} — {jobStatus.progreso_pct}%
+              </strong>
+              <span>
+                Eventos detectados: <strong>{jobStatus.eventos_encontrados}</strong> (Jarras:{' '}
+                <strong>{jobStatus.jarras_encontradas}</strong>)
+              </span>
+              <button className="btn-danger" onClick={handleCancelJob}>
+                Detener y Guardar
+              </button>
+            </div>
+            <div className="progress-track">
+              <div
+                className="progress-fill"
+                style={{ width: `${Math.max(3, jobStatus.progreso_pct)}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         {actionMsg && <div className="action-banner">{actionMsg}</div>}
 
-        {/* Resumen inmediato cuando el dueno termina de analizar un video */}
-        {lastReport && (
+        {liveStatus.error && (
+          <div className="action-banner" style={{ borderColor: '#f93e3e', color: '#b41d1d' }}>
+            Error en fuente de video: {liveStatus.error}
+          </div>
+        )}
+
+        {/* Resumen inmediato al terminar un analisis */}
+        {lastReport && !jobStatus.activo && (
           <div className="report-summary-box">
-            <h3>Resultado del video analizado: {lastReport.fuente.replace('videos/', '')}</h3>
+            <h3>
+              Ultimo analisis completado [{CAMERA_LABELS[lastReport.camera_id] || lastReport.camera_id}]:{' '}
+              {lastReport.fuente.replace('videos/', '')}
+            </h3>
             <p>
-              Duracion: <strong>{lastReport.duracion_video_s}s</strong> | Jarras levantadas:{' '}
-              <strong>{lastReport.jarras_levantadas}</strong> | Jarras devueltas:{' '}
-              <strong>{lastReport.jarras_devueltas}</strong> | Total movimientos en mesa:{' '}
-              <strong>{lastReport.objetos_levantados_total} salidas</strong>
+              Duracion analizada: <strong>{lastReport.duracion_video_s}s</strong> | Jarras levantadas:{' '}
+              <strong>{lastReport.jarras_levantadas}</strong> | Total salidas de zona:{' '}
+              <strong>{lastReport.objetos_levantados_total}</strong>
             </p>
-            {lastReport.conteo_por_clase && (
+            {lastReport.conteo_por_clase && Object.keys(lastReport.conteo_por_clase).length > 0 && (
               <div className="report-tags">
                 {Object.entries(lastReport.conteo_por_clase).map(([cls, c]) => (
                   <span key={cls} className="report-tag">
@@ -397,20 +571,28 @@ export default function App() {
           </div>
         )}
 
-        {liveStatus.error && (
-          <div className="action-banner" style={{ borderColor: '#f93e3e', color: '#b41d1d' }}>
-            Error en fuente de video: {liveStatus.error}
-          </div>
-        )}
-
+        {/* Reproductor MJPEG en vivo con selector rapido de cambio de camara */}
         {liveStatus.activo && (
           <div className="live-stream-box">
             <div className="live-stream-header">
-              <strong>
-                Vista en Directo — {liveStatus.fuente} ({liveStatus.resolucion || 'Cargando...'}) |{' '}
-                Jarras Lev: {liveStatus.jarras_levantadas_sesion || 0} | Total Obj Lev:{' '}
-                {liveStatus.objetos_levantados_sesion || 0}
-              </strong>
+              <div>
+                <strong>
+                  Vista con Marcas [{CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id}] —{' '}
+                  {liveStatus.fuente.replace('videos/', '')} ({liveStatus.resolucion})
+                </strong>
+                <div className="live-quick-switch">
+                  <span>Cambiar camara en vivo:</span>
+                  {cameras.map((c) => (
+                    <button
+                      key={c.id}
+                      className={`btn-mini ${liveStatus.camera_id === c.id ? 'active' : ''}`}
+                      onClick={() => handleStartLive(c.rtsp_url || c.default_video, c.id)}
+                    >
+                      {CAMERA_LABELS[c.id] || c.nombre}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <button className="btn-danger" onClick={handleStopLive}>
                 Cerrar Vista
               </button>
@@ -427,7 +609,19 @@ export default function App() {
       {/* FILTROS DE CONSULTA */}
       <section className="filters-bar">
         <div className="filter-group">
-          <label>Filtrar por Fecha</label>
+          <label>Camara</label>
+          <select value={cameraFilter} onChange={(e) => handleSelectCameraTab(e.target.value)}>
+            <option value="">Todas las camaras</option>
+            {cameras.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.nombre}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="filter-group">
+          <label>Fecha</label>
           <input
             type="date"
             value={dateFilter}
@@ -435,13 +629,13 @@ export default function App() {
           />
           {dateFilter && (
             <button className="btn-clear" onClick={() => setDateFilter('')}>
-              Mostrar todas las fechas
+              Mostrar todas
             </button>
           )}
         </div>
 
         <div className="filter-group">
-          <label>Horario / Turno</label>
+          <label>Turno</label>
           <select value={shiftFilter} onChange={(e) => setShiftFilter(e.target.value)}>
             {Object.entries(SHIFTS).map(([key, s]) => (
               <option key={key} value={key}>
@@ -452,10 +646,10 @@ export default function App() {
         </div>
 
         <div className="filter-group">
-          <label>Utensilio / Objeto</label>
+          <label>Objeto</label>
           <select value={classFilter} onChange={(e) => setClassFilter(e.target.value)}>
-            <option value="">Todos los registrados</option>
-            {KNOWN_CLASSES.map((cls) => (
+            <option value="">Todos los objetos</option>
+            {availableClasses.map((cls) => (
               <option key={cls} value={cls}>
                 {cls}
               </option>
@@ -464,34 +658,38 @@ export default function App() {
         </div>
 
         <button className="btn-secondary" onClick={fetchData}>
-          Refrescar Tabla
+          Refrescar
         </button>
       </section>
 
-      {/* TARJETAS DE RESUMEN */}
+      {/* TARJETAS KPI */}
       <section className="kpi-grid">
         <div className="kpi-card highlight">
           <span className="kpi-title">Jarras Levantadas</span>
           <strong className="kpi-value">{kpis.jarrasLev}</strong>
-          <span className="kpi-sub">Puestas de vuelta en mesa: {kpis.jarrasDev}</span>
+          <span className="kpi-sub">Devueltas a zona: {kpis.jarrasDev}</span>
         </div>
 
         <div className="kpi-card">
-          <span className="kpi-title">Total Utensilios Levantados</span>
+          <span className="kpi-title">Total Objetos Levantados</span>
           <strong className="kpi-value">{kpis.objLev}</strong>
-          <span className="kpi-sub">Puestos en mesa: {kpis.objDev}</span>
+          <span className="kpi-sub">Devueltos a zona: {kpis.objDev}</span>
         </div>
 
         <div className="kpi-card">
           <span className="kpi-title">Movimientos en Bitacora</span>
           <strong className="kpi-value">{filteredEvents.length}</strong>
-          <span className="kpi-sub">Con los filtros seleccionados</span>
+          <span className="kpi-sub">
+            Filtro: {cameraFilter ? CAMERA_LABELS[cameraFilter] : 'Todas las camaras'}
+          </span>
         </div>
 
         <div className="kpi-card">
-          <span className="kpi-title">Tipos de Objetos Vistos</span>
-          <strong className="kpi-value">{Object.keys(totalsByClass).length}</strong>
-          <span className="kpi-sub">Reconocimiento propio de cocina</span>
+          <span className="kpi-title">Camaras Configuradas</span>
+          <strong className="kpi-value">{cameras.length}</strong>
+          <span className="kpi-sub">
+            {activeCameraObj ? activeCameraObj.zona_roi : 'Cocina 1, Cocina 2, Almacen'}
+          </span>
         </div>
       </section>
 
@@ -499,10 +697,10 @@ export default function App() {
         {/* GRAFICO POR HORA */}
         <section className="panel chart-panel">
           <div className="panel-header">
-            <h2>Movimiento por Hora en Mesa de Cocina</h2>
+            <h2>Actividad por Hora (Salidas vs Entradas en Zonas ROI)</h2>
             <div className="legend">
-              <span className="dot lifted-dot" /> Salida de mesa (levantado)
-              <span className="dot returned-dot" /> Entrada a mesa (devuelto)
+              <span className="dot lifted-dot" /> Levantado (salida)
+              <span className="dot returned-dot" /> Devuelto (entrada)
             </div>
           </div>
 
@@ -530,52 +728,98 @@ export default function App() {
               )
             })}
           </div>
+
+          {/* Resumen rapido por zona ROI debajo del grafico */}
+          {Object.keys(totalsByZone).length > 0 && (
+            <div className="zones-summary">
+              <h3>Actividad por Zona ROI</h3>
+              <div className="report-tags">
+                {Object.entries(totalsByZone).map(([zName, c]) => (
+                  <span key={zName} className="zone-chip">
+                    {zName}: <strong>{c.levantados}</strong> sal. / <strong>{c.devueltos}</strong> ent.
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </section>
 
-        {/* CONTEO POR OBJETO Y CAMARAS */}
+        {/* CONTEO POR OBJETO Y FICHAS DE LAS 3 CAMARAS */}
         <aside className="side-panels">
           <section className="panel">
             <h2>Resumen por Tipo de Objeto</h2>
             {Object.keys(totalsByClass).length === 0 ? (
-              <p className="empty-msg">No hay registros para este filtro.</p>
+              <p className="empty-msg">Sin registros para los filtros actuales.</p>
             ) : (
               <ul className="class-list">
-                {Object.entries(totalsByClass).map(([clsName, counts]) => (
-                  <li key={clsName} className="class-item">
-                    <span className="class-name">{clsName}</span>
-                    <div className="class-badges">
-                      <span className="pill lifted-pill">
-                        {counts.levantados} salidas
-                      </span>
-                      <span className="pill returned-pill">
-                        {counts.devueltos} entradas
-                      </span>
-                    </div>
-                  </li>
-                ))}
+                {Object.entries(totalsByClass)
+                  .sort((a, b) => b[1].levantados - a[1].levantados)
+                  .map(([clsName, counts]) => (
+                    <li key={clsName} className="class-item">
+                      <span className="class-name">{clsName}</span>
+                      <div className="class-badges">
+                        <span className="pill lifted-pill">{counts.levantados} sal.</span>
+                        <span className="pill returned-pill">{counts.devueltos} ent.</span>
+                      </div>
+                    </li>
+                  ))}
               </ul>
             )}
           </section>
 
           <section className="panel">
-            <h2>Ficha de Camara</h2>
-            {cameras.length === 0 ? (
-              <p className="empty-msg">Consultando camara...</p>
-            ) : (
-              cameras.map((cam) => (
-                <div key={cam.id} className="camera-card">
+            <h2>Camaras de Nex ({cameras.length})</h2>
+            <div className="cameras-stack">
+              {cameras.map((cam) => (
+                <div
+                  key={cam.id}
+                  className={`camera-card ${activeCamId === cam.id ? 'selected-cam' : ''}`}
+                >
                   <div className="camera-header">
                     <strong>{cam.nombre}</strong>
-                    <span className="cam-status active">
-                      {cam.estado.toUpperCase()}
+                    <span
+                      className={`cam-status ${
+                        cam.estado === 'en_vivo'
+                          ? 'live'
+                          : cam.estado === 'rtsp_listo'
+                          ? 'active'
+                          : 'video'
+                      }`}
+                    >
+                      {cam.estado === 'en_vivo'
+                        ? 'EN VIVO'
+                        : cam.estado === 'rtsp_listo'
+                        ? 'RTSP LISTO'
+                        : 'MODO VIDEO'}
                     </span>
                   </div>
-                  <p><strong>Formato:</strong> {cam.resolucion}</p>
-                  <p><strong>Zona vigilada:</strong> {cam.zona_roi}</p>
-                  <p><strong>Archivo / Stream:</strong> {cam.fuente_actual}</p>
+                  <p>
+                    <strong>Zonas:</strong> {cam.zona_roi}
+                  </p>
+                  <p>
+                    <strong>RTSP:</strong>{' '}
+                    {cam.rtsp_url ? <code>{cam.rtsp_url}</code> : <span className="muted-sm">Pendiente (se configura en local)</span>}
+                  </p>
+                  <p>
+                    <strong>Eventos en BD:</strong> {cam.eventos_registrados}
+                  </p>
+                  <div className="cam-card-actions">
+                    <button
+                      className="btn-mini"
+                      onClick={() => handleSelectCameraTab(cam.id)}
+                    >
+                      Filtrar
+                    </button>
+                    <button
+                      className="btn-mini active"
+                      onClick={() => handleStartLive(cam.rtsp_url || cam.default_video, cam.id)}
+                    >
+                      Ver con Marcas
+                    </button>
+                  </div>
                 </div>
-              ))
-            )}
+              ))}
+            </div>
           </section>
         </aside>
       </div>
@@ -593,33 +837,41 @@ export default function App() {
               <thead>
                 <tr>
                   <th>Nro</th>
+                  <th>Camara</th>
                   <th>Objeto</th>
-                  <th>Identificador</th>
+                  <th>Track</th>
                   <th>Movimiento</th>
-                  <th>Zona</th>
+                  <th>Zona ROI</th>
                   <th>Momento en Video</th>
                   <th>Fecha y Hora</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredEvents.map((ev) => (
+                {filteredEvents.slice(0, 150).map((ev) => (
                   <tr key={ev.id}>
                     <td>#{ev.id}</td>
                     <td>
+                      <span className="cam-chip">
+                        {CAMERA_LABELS[ev.camera_id] || ev.camera_id}
+                      </span>
+                    </td>
+                    <td>
                       <strong>{ev.class_name}</strong>
                     </td>
-                    <td>Pieza #{ev.track_id}</td>
+                    <td>#{ev.track_id}</td>
                     <td>
                       <span
                         className={`action-tag ${
                           ev.event_type === 'salida' ? 'tag-lifted' : 'tag-returned'
                         }`}
                       >
-                        {ev.event_type === 'salida' ? 'Levantado de mesa' : 'Puesto en mesa'}
+                        {ev.event_type === 'salida' ? 'LEVANTADO (Salida)' : 'DEVUELTO (Entrada)'}
                       </span>
                     </td>
                     <td>{ev.zone}</td>
-                    <td>{ev.time_s} seg (cuadro {ev.frame})</td>
+                    <td>
+                      {ev.time_s}s (f.{ev.frame})
+                    </td>
                     <td>
                       {ev.created_at
                         ? new Date(ev.created_at).toLocaleString('es-BO')

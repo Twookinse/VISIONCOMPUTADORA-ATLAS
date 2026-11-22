@@ -1,17 +1,13 @@
 """
-Script para contar jarras levantadas en un video o camara.
+Script para contar jarras y utensilios levantados en un video o camara de Nex.
 
-Combina tracking (src/detection/tracker.py), zonas (config/zones/*.json)
-y la logica de cocina (src/analysis/kitchen.py).
+Detecta automaticamente la camara y sus zonas ROI desde config/cameras.json
+(cocina_1, cocina_2, almacen) y guarda el reporte en output/ y en SQLite.
 
 Uso:
-    python scripts/run_counting.py --source "videos/VIDEO 2 VISION COMPUTADORA.mp4"
-    python scripts/run_counting.py --source 0 --show
-    python scripts/run_counting.py --source rtsp://ip:554/stream --zones config/zones/nex_cocina_cam1.json
-
-Genera en output/:
-    <video>_conteo.mp4   Video con zonas, objetos y contador dibujados
-    <video>_conteo.json  Reporte con el total y cada evento (frame, segundo, ID)
+    python scripts/run_counting.py --source "videos/COCINA 1 VIDEO 1.mp4"
+    python scripts/run_counting.py --camera cocina_2
+    python scripts/run_counting.py --source rtsp://ip:554/stream --camera cocina_1 --show
 """
 
 import argparse
@@ -27,28 +23,35 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.detection.tracker import Tracker
 from src.events.zones import load_zones, draw_zones
-from src.analysis.kitchen import KitchenAnalyzer, DEFAULT_JAR_CLASSES
+from src.analysis.kitchen import KitchenAnalyzer
+from src.config.cameras import get_camera_by_id, detect_camera_for_source
 from src.db.models import save_report_to_db
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Contar jarras levantadas")
-    parser.add_argument("--source", required=True,
-                        help="Video, 0 para camara web, o URL RTSP")
+    parser = argparse.ArgumentParser(description="Contar objetos de cocina levantados (Nex)")
+    parser.add_argument("--source", default=None,
+                        help="Video, 0 para camara web, o URL RTSP (opcional si usas --camera)")
+    parser.add_argument("--camera", default=None,
+                        help="ID de camara de config/cameras.json: cocina_1, cocina_2 o almacen")
     parser.add_argument("--model", default="models/custom/jarras_nex_v1.pt",
                         help="Modelo YOLO (default: models/custom/jarras_nex_v1.pt)")
-    parser.add_argument("--zones", default="config/zones/casa_cocina.json",
-                        help="Archivo de zonas (default: config/zones/casa_cocina.json)")
+    parser.add_argument("--zones", default=None,
+                        help="Archivo de zonas (si se omite, se detecta segun la camara)")
     parser.add_argument("--tracker", default="config/trackers/bytetrack_cocina.yaml",
-                        help="Configuracion del tracker (default: config/trackers/bytetrack_cocina.yaml)")
-    parser.add_argument("--classes", nargs="+", default=DEFAULT_JAR_CLASSES,
-                        help="Clases movibles a monitorear en las zonas")
+                        help="Configuracion del tracker")
+    parser.add_argument("--classes", nargs="+", default=None,
+                        help="Clases especificas a monitorear (si se omite, monitorea todas las movibles)")
     parser.add_argument("--confidence", type=float, default=0.25,
                         help="Confianza minima de deteccion (default: 0.25)")
-    parser.add_argument("--min-frames", type=int, default=3,
-                        help="Frames para confirmar una salida o entrada (default: 3)")
-    parser.add_argument("--skip-frames", type=int, default=1,
-                        help="Procesar 1 de cada N frames (default: 1)")
+    parser.add_argument("--min-frames", type=int, default=4,
+                        help="Frames procesados para confirmar una salida o entrada (default: 4)")
+    parser.add_argument("--skip-frames", type=int, default=0,
+                        help="Procesar 1 de cada N frames (0 = automatico: 3 en 60fps, 1 en 30fps)")
+    parser.add_argument("--max-seconds", type=float, default=0.0,
+                        help="Opcional: limitar analisis a los primeros N segundos (0 = video completo)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="No guardar video MP4 anotado (mas rapido, solo JSON + SQLite)")
     parser.add_argument("--output", default="output",
                         help="Carpeta de salida (default: output/)")
     parser.add_argument("--show", action="store_true",
@@ -58,11 +61,26 @@ def parse_args():
 
 def main():
     args = parse_args()
-    source = int(args.source) if args.source.isdigit() else args.source
 
-    zones = load_zones(PROJECT_ROOT / args.zones)
+    cam_cfg = get_camera_by_id(args.camera) if args.camera else None
+    if not args.source:
+        if cam_cfg:
+            args.source = cam_cfg.get("rtsp_url") or cam_cfg.get("default_video")
+        else:
+            print("Error: debes indicar --source <video/rtsp> o --camera <cocina_1|cocina_2|almacen>")
+            sys.exit(1)
+
+    if not cam_cfg:
+        cam_cfg = detect_camera_for_source(args.source)
+
+    camera_id = cam_cfg["id"] if cam_cfg else "cocina_1"
+    zones_rel = args.zones or (cam_cfg["zones_file"] if cam_cfg else "config/zones/cocina_1.json")
+
+    source = int(args.source) if str(args.source).isdigit() else args.source
+
+    zones = load_zones(PROJECT_ROOT / zones_rel)
     if not zones:
-        print(f"Error: no hay zonas en '{args.zones}'. Dibujalas con scripts/draw_zones.py")
+        print(f"Error: no hay zonas en '{zones_rel}'. Dibujalas con scripts/draw_zones.py")
         sys.exit(1)
 
     tracker = Tracker(
@@ -83,23 +101,27 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     is_file = total_frames > 0
 
-    print(f"Fuente: {args.source}")
+    skip_frames = args.skip_frames if args.skip_frames >= 1 else (3 if fps >= 45 else 1)
+    max_frames = int(args.max_seconds * fps) if args.max_seconds > 0 else 0
+
+    print(f"Camara: {camera_id} ({cam_cfg['nombre'] if cam_cfg else camera_id})")
+    print(f"Fuente: {args.source} ({width}x{height} @ {fps:.1f} FPS, skip={skip_frames})")
     print(f"Modelo: {args.model}")
-    print(f"Zonas usadas: {[z.name for z in analyzer.zones]}")
-    print(f"Clases monitoreadas: {sorted(analyzer.jar_classes)}")
+    print(f"Zonas ({len(analyzer.zones)}): {[z.name for z in analyzer.zones]}")
     print()
 
     writer = None
     output_dir = PROJECT_ROOT / args.output
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_name = Path(str(source)).stem if isinstance(source, str) else "camara"
+    source_name = Path(str(source)).stem if isinstance(source, str) else camera_id
     video_path = output_dir / f"{source_name}_conteo.mp4"
     report_path = output_dir / f"{source_name}_conteo.json"
-    if is_file:
+    if is_file and not args.no_video:
         writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"),
                                  fps, (width, height))
 
     frame_count = 0
+    processed_count = 0
     last_event_text = ""
     last_event_frame = -999
     start_time = time.time()
@@ -110,39 +132,40 @@ def main():
             if not ret:
                 break
             frame_count += 1
-            if frame_count % args.skip_frames != 0:
+            if max_frames and frame_count > max_frames:
+                break
+            if frame_count % skip_frames != 0:
                 continue
 
+            processed_count += 1
             results = tracker.track(frame)
             new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
 
             for event in new_events:
                 action = "LEVANTADO/A" if event.event_type == "salida" else "DEVUELTO/A"
-                last_event_text = f"{event.class_name} #{event.track_id} {action}"
+                last_event_text = f"{event.class_name} #{event.track_id} {action} ({event.zone})"
                 last_event_frame = frame_count
                 print(f"  [{event.time_s:6.1f}s] {event.class_name} #{event.track_id} "
                       f"{event.event_type} de '{event.zone}'")
 
-            # Dibujar objetos, zonas y contador
-            annotated = draw_zones(results.plot(), analyzer.zones)
-            cv2.rectangle(annotated, (0, 0), (width, 34), (0, 0, 0), -1)
-            hud_text = (f"Jarras Lev: {analyzer.lifted} Dev: {analyzer.returned} | "
-                        f"Total Objetos Lev: {analyzer.total_lifted}")
-            cv2.putText(annotated, hud_text,
-                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-            # Mostrar el ultimo evento durante ~1.5 segundos
-            if frame_count - last_event_frame < fps * 1.5:
-                cv2.putText(annotated, last_event_text, (10, 64),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            if writer or args.show:
+                annotated = draw_zones(results.plot(), analyzer.zones)
+                cv2.rectangle(annotated, (0, 0), (width, 40), (0, 0, 0), -1)
+                hud_text = (f"[{camera_id.upper()}] Jarras Lev: {analyzer.lifted} "
+                            f"Dev: {analyzer.returned} | Total Obj Lev: {analyzer.total_lifted}")
+                cv2.putText(annotated, hud_text,
+                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                if frame_count - last_event_frame < fps * 1.5:
+                    cv2.putText(annotated, last_event_text, (10, 72),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            if writer:
-                # Se repite el frame para que el video de salida conserve la duracion real
-                for _ in range(args.skip_frames):
-                    writer.write(annotated)
-            if args.show:
-                cv2.imshow("Conteo", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                if writer:
+                    for _ in range(skip_frames):
+                        writer.write(annotated)
+                if args.show:
+                    cv2.imshow("Conteo Nex", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
     except KeyboardInterrupt:
         print("\nDetenido por el usuario")
@@ -155,10 +178,12 @@ def main():
         cv2.destroyAllWindows()
 
         report = {
+            "camera_id": camera_id,
             "fuente": str(args.source),
             "modelo": args.model,
-            "zonas_archivo": args.zones,
+            "zonas_archivo": zones_rel,
             "frames_procesados": frame_count,
+            "frames_inferidos": processed_count,
             "duracion_video_s": round(frame_count / fps, 1),
             "tiempo_proceso_s": round(elapsed, 1),
             **analyzer.summary(),
@@ -169,6 +194,7 @@ def main():
         run_id = save_report_to_db(report)
 
         print()
+        print(f"Camara: {camera_id}")
         print(f"Jarras: {analyzer.lifted} levantadas y {analyzer.returned} devueltas")
         print(f"Total objetos de cocina: {analyzer.total_lifted} levantados "
               f"y {analyzer.total_returned} devueltos")

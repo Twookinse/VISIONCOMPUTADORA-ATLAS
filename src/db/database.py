@@ -8,7 +8,7 @@ NEX_DB_URL (util para pruebas automatizadas).
 
 import os
 from pathlib import Path
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -31,6 +31,15 @@ def get_db_url(db_path=None):
     return f"sqlite:///{DEFAULT_DB_PATH}"
 
 
+def _ensure_camera_id_columns(engine):
+    """Agrega la columna camera_id si la base de datos fue creada con una version anterior."""
+    with engine.begin() as conn:
+        for table in ("pipeline_runs", "kitchen_events"):
+            cols = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+            if cols and "camera_id" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN camera_id VARCHAR DEFAULT 'cocina_1'"))
+
+
 def create_session_factory(db_path=None):
     """Crea o reutiliza el motor SQLAlchemy, inicializa las tablas y devuelve SessionLocal."""
     url = get_db_url(db_path)
@@ -38,6 +47,7 @@ def create_session_factory(db_path=None):
         engine = create_engine(url, connect_args={"check_same_thread": False})
         from src.db import models  # noqa: F401
         Base.metadata.create_all(bind=engine)
+        _ensure_camera_id_columns(engine)
         _ENGINES[url] = engine
     return sessionmaker(autocommit=False, autoflush=False, bind=_ENGINES[url])
 

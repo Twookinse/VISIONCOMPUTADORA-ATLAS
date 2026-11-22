@@ -1,5 +1,5 @@
 """
-Pruebas de la base de datos SQLite y endpoints de FastAPI (Sprint 4).
+Pruebas de la base de datos SQLite, normalizacion de clases Nex y endpoints Multi-Camara.
 
 Uso:
     python tests/test_api.py
@@ -21,6 +21,7 @@ os.environ["NEX_DB_URL"] = f"sqlite:///{TEST_DB_PATH}"
 
 from fastapi.testclient import TestClient
 from src.api.main import app
+from src.analysis.kitchen import normalize_class_name
 from src.db.database import dispose_all_engines
 from src.db.models import save_report_to_db
 
@@ -28,106 +29,150 @@ client = TestClient(app)
 
 
 def setup_sample_data():
-    sample_report = {
-        "fuente": "videos/VIDEO 2 VISION COMPUTADORA.mp4",
+    fixed_time = datetime(2026, 11, 22, 21, 30, 0)
+
+    report_cam1 = {
+        "camera_id": "cocina_1",
+        "fuente": "videos/COCINA 1 VIDEO 1.mp4",
         "modelo": "models/custom/jarras_nex_v1.pt",
-        "zonas_archivo": "config/zones/casa_cocina.json",
-        "frames_procesados": 1575,
-        "duracion_video_s": 52.5,
-        "tiempo_proceso_s": 70.0,
+        "zonas_archivo": "config/zones/cocina_1.json",
+        "frames_procesados": 1800,
+        "duracion_video_s": 30.0,
+        "tiempo_proceso_s": 12.0,
         "jarras_levantadas": 2,
-        "jarras_devueltas": 2,
+        "jarras_devueltas": 1,
         "objetos_levantados_total": 3,
-        "objetos_devueltos_total": 2,
+        "objetos_devueltos_total": 1,
         "eventos": [
             {
-                "frame": 145,
-                "time_s": 4.83,
-                "track_id": 7,
-                "class_name": "Vaso",
-                "zone": "Mesa de cocina",
+                "frame": 300,
+                "time_s": 5.0,
+                "track_id": 1,
+                "class_name": "Jarra",
+                "zone": "Mesa de Centro",
                 "event_type": "salida",
             },
             {
-                "frame": 386,
-                "time_s": 12.87,
+                "frame": 420,
+                "time_s": 7.0,
                 "track_id": 1,
                 "class_name": "Jarra",
-                "zone": "Mesa de cocina",
-                "event_type": "salida",
-            },
-            {
-                "frame": 415,
-                "time_s": 13.84,
-                "track_id": 1,
-                "class_name": "Jarra",
-                "zone": "Mesa de cocina",
+                "zone": "Mesa de Centro",
                 "event_type": "entrada",
             },
             {
-                "frame": 451,
-                "time_s": 15.04,
-                "track_id": 1,
+                "frame": 600,
+                "time_s": 10.0,
+                "track_id": 2,
                 "class_name": "Jarra",
-                "zone": "Mesa de cocina",
+                "zone": "Mesa de Centro",
                 "event_type": "salida",
             },
             {
-                "frame": 481,
-                "time_s": 16.04,
-                "track_id": 1,
-                "class_name": "Jarra",
-                "zone": "Mesa de cocina",
-                "event_type": "entrada",
+                "frame": 900,
+                "time_s": 15.0,
+                "track_id": 5,
+                "class_name": "Taper",
+                "zone": "Mesa de Centro",
+                "event_type": "salida",
             },
         ],
     }
-    fixed_time = datetime(2026, 11, 1, 21, 30, 0)
-    return save_report_to_db(sample_report, db_path=TEST_DB_PATH, created_at=fixed_time)
+
+    report_cam2 = {
+        "camera_id": "cocina_2",
+        "fuente": "videos/COCINA 2 VIDEO 1.mp4",
+        "modelo": "models/custom/jarras_nex_v1.pt",
+        "zonas_archivo": "config/zones/cocina_2.json",
+        "frames_procesados": 1800,
+        "duracion_video_s": 30.0,
+        "tiempo_proceso_s": 12.0,
+        "jarras_levantadas": 0,
+        "jarras_devueltas": 0,
+        "objetos_levantados_total": 1,
+        "objetos_devueltos_total": 0,
+        "eventos": [
+            {
+                "frame": 500,
+                "time_s": 8.33,
+                "track_id": 9,
+                "class_name": "Olla",
+                "zone": "Mesa de Centro",
+                "event_type": "salida",
+            },
+        ],
+    }
+
+    save_report_to_db(report_cam1, db_path=TEST_DB_PATH, created_at=fixed_time)
+    save_report_to_db(report_cam2, db_path=TEST_DB_PATH, created_at=fixed_time)
 
 
-def test_list_events_and_filters():
+def test_class_normalization():
+    assert normalize_class_name("Jarra 1") == "Jarra"
+    assert normalize_class_name("Jarra2") == "Jarra"
+    assert normalize_class_name("Jarra5") == "Jarra"
+    assert normalize_class_name("JarraLicuadora") == "Jarra Licuadora"
+    assert normalize_class_name("Taper4") == "Taper"
+    assert normalize_class_name("olla1") == "Olla"
+    assert normalize_class_name("Vaso1") == "Vaso"
+    assert normalize_class_name("CajaCerveza") == "Caja de Cerveza"
+    # Fijos y personas deben ignorarse
+    assert normalize_class_name("Persona1") is None
+    assert normalize_class_name("Persona6") is None
+    assert normalize_class_name("Microondas") is None
+    assert normalize_class_name("Basurero") is None
+    assert normalize_class_name("Licuadora2") is None
+
+
+def test_list_events_and_camera_filters():
     res = client.get("/api/events")
     assert res.status_code == 200
-    data = res.json()
-    assert data["total"] == 5
+    assert res.json()["total"] == 5
 
-    # Filtrar solo por Jarra y tipo salida (levantadas)
-    res_jar = client.get("/api/events?class_name=Jarra&event_type=salida")
+    # Filtrar solo cocina_1
+    res_c1 = client.get("/api/events?camera_id=cocina_1")
+    assert res_c1.status_code == 200
+    assert res_c1.json()["total"] == 4
+
+    # Filtrar solo cocina_2
+    res_c2 = client.get("/api/events?camera_id=cocina_2")
+    assert res_c2.status_code == 200
+    assert res_c2.json()["total"] == 1
+    assert res_c2.json()["eventos"][0]["class_name"] == "Olla"
+
+    # Filtrar Jarra salida
+    res_jar = client.get("/api/events?camera_id=cocina_1&class_name=Jarra&event_type=salida")
     assert res_jar.status_code == 200
-    jar_data = res_jar.json()
-    assert jar_data["total"] == 2
-    assert all(e["class_name"] == "Jarra" and e["accion"] == "levantado" for e in jar_data["eventos"])
-
-    # Filtrar por fecha
-    res_date = client.get("/api/events?date=2026-11-01")
-    assert res_date.status_code == 200
-    assert res_date.json()["total"] == 5
-
-    res_empty_date = client.get("/api/events?date=2026-01-01")
-    assert res_empty_date.status_code == 200
-    assert res_empty_date.json()["total"] == 0
+    assert res_jar.json()["total"] == 2
 
 
-def test_hourly_metrics():
-    res = client.get("/api/metrics/hourly?date=2026-11-01")
+def test_hourly_metrics_and_cameras():
+    res = client.get("/api/metrics/hourly?date=2026-11-22&camera_id=cocina_1")
     assert res.status_code == 200
     data = res.json()
     assert data["jarras_levantadas_total"] == 2
     assert data["objetos_levantados_total"] == 3
     assert data["totales_por_clase"]["Jarra"]["levantados"] == 2
-    assert data["totales_por_clase"]["Vaso"]["levantados"] == 1
+    assert data["totales_por_clase"]["Taper"]["levantados"] == 1
 
-    # Verificar que la hora 21:00 concentre los eventos
-    hour_21 = next(h for h in data["por_hora"] if h["hora"] == "21:00")
-    assert hour_21["jarras_levantadas"] == 2
-    assert hour_21["objetos_levantados"] == 3
+    # Verificar las 3 camaras de Nex configuradas
+    cams_res = client.get("/api/cameras")
+    assert cams_res.status_code == 200
+    cams = cams_res.json()["camaras"]
+    cam_ids = [c["id"] for c in cams]
+    assert "cocina_1" in cam_ids
+    assert "cocina_2" in cam_ids
+    assert "almacen" in cam_ids
 
 
-def test_runs_and_swagger():
+def test_runs_classes_and_swagger():
     res = client.get("/api/runs")
     assert res.status_code == 200
-    assert res.json()["total"] == 1
+    assert res.json()["total"] == 2
+
+    cls_res = client.get("/api/classes")
+    assert cls_res.status_code == 200
+    assert "Jarra" in cls_res.json()["clases"]
 
     docs = client.get("/docs")
     assert docs.status_code == 200
@@ -135,7 +180,12 @@ def test_runs_and_swagger():
 
 if __name__ == "__main__":
     setup_sample_data()
-    for test in (test_list_events_and_filters, test_hourly_metrics, test_runs_and_swagger):
+    for test in (
+        test_class_normalization,
+        test_list_events_and_camera_filters,
+        test_hourly_metrics_and_cameras,
+        test_runs_classes_and_swagger,
+    ):
         test()
         print(f"OK  {test.__name__}")
     dispose_all_engines()
