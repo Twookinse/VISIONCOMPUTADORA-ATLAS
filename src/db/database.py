@@ -31,13 +31,62 @@ def get_db_url(db_path=None):
     return f"sqlite:///{DEFAULT_DB_PATH}"
 
 
+def _table_columns(conn, table):
+    return [row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+
+
 def _ensure_camera_id_columns(engine):
-    """Agrega la columna camera_id si la base de datos fue creada con una version anterior."""
+    """Migra BDs de versiones anteriores agregando las columnas nuevas.
+
+    Al agregar la columna 'mode' por primera vez tambien se ordenan los datos viejos:
+    - Las reproducciones con marcas de videos grabados ("EN_VIVO: videos/...") pasan
+      a modo 'demo' (se excluyen de las metricas).
+    - Los analisis repetidos del mismo video se reducen al mas reciente.
+    """
     with engine.begin() as conn:
         for table in ("pipeline_runs", "kitchen_events"):
-            cols = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+            cols = _table_columns(conn, table)
             if cols and "camera_id" not in cols:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN camera_id VARCHAR DEFAULT 'cocina_1'"))
+        ev_cols = _table_columns(conn, "kitchen_events")
+        if ev_cols and "snapshot_file" not in ev_cols:
+            conn.execute(text("ALTER TABLE kitchen_events ADD COLUMN snapshot_file VARCHAR DEFAULT ''"))
+
+        run_cols = _table_columns(conn, "pipeline_runs")
+        if not run_cols:
+            return
+        if "video_start" not in run_cols:
+            conn.execute(text("ALTER TABLE pipeline_runs ADD COLUMN video_start DATETIME"))
+        if "start_time_estimated" not in run_cols:
+            conn.execute(text("ALTER TABLE pipeline_runs ADD COLUMN start_time_estimated BOOLEAN DEFAULT 1"))
+        if "source_key" not in run_cols:
+            conn.execute(text("ALTER TABLE pipeline_runs ADD COLUMN source_key VARCHAR"))
+
+        if "mode" not in run_cols:
+            conn.execute(text("ALTER TABLE pipeline_runs ADD COLUMN mode VARCHAR DEFAULT 'video'"))
+            conn.execute(text("""
+                UPDATE pipeline_runs SET mode = CASE
+                    WHEN source LIKE 'EN_VIVO: rtsp%' OR source GLOB 'EN_VIVO: [0-9]*' THEN 'live'
+                    WHEN source LIKE 'EN_VIVO:%' THEN 'demo'
+                    ELSE 'video' END
+            """))
+            # Conservar solo el analisis mas reciente de cada video grabado
+            dup_runs = """
+                SELECT id FROM pipeline_runs WHERE mode = 'video' AND id NOT IN (
+                    SELECT MAX(id) FROM pipeline_runs WHERE mode = 'video' GROUP BY source
+                )
+            """
+            conn.execute(text(f"DELETE FROM kitchen_events WHERE run_id IN ({dup_runs})"))
+            conn.execute(text(f"DELETE FROM pipeline_runs WHERE id IN ({dup_runs})"))
+
+        if "mode" not in _table_columns(conn, "kitchen_events"):
+            conn.execute(text("ALTER TABLE kitchen_events ADD COLUMN mode VARCHAR DEFAULT 'video'"))
+            conn.execute(text("""
+                UPDATE kitchen_events SET mode = COALESCE(
+                    (SELECT mode FROM pipeline_runs WHERE pipeline_runs.id = kitchen_events.run_id),
+                    'video'
+                )
+            """))
 
 
 def create_session_factory(db_path=None):

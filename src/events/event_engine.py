@@ -23,6 +23,7 @@ class ZoneEvent:
     class_name: str
     zone: str
     event_type: str  # "entrada" o "salida"
+    snapshot_file: str = ""
 
     def to_dict(self):
         return asdict(self)

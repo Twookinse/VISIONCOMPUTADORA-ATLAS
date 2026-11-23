@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.detection.tracker import Tracker
+from src.detection.visualizer import render_annotated_frame, save_event_snapshot
 from src.events.zones import load_zones, draw_zones
 from src.analysis.kitchen import KitchenAnalyzer
 from src.config.cameras import get_camera_by_id, detect_camera_for_source
@@ -142,14 +143,24 @@ def main():
             new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
 
             for event in new_events:
+                event.snapshot_file = save_event_snapshot(
+                    frame, results, event, analyzer.zones, output_dir / "snapshots", camera_id
+                )
                 action = "LEVANTADO/A" if event.event_type == "salida" else "DEVUELTO/A"
                 last_event_text = f"{event.class_name} #{event.track_id} {action} ({event.zone})"
                 last_event_frame = frame_count
                 print(f"  [{event.time_s:6.1f}s] {event.class_name} #{event.track_id} "
-                      f"{event.event_type} de '{event.zone}'")
+                      f"{event.event_type} de '{event.zone}' -> foto: {event.snapshot_file}")
 
             if writer or args.show:
-                annotated = draw_zones(results.plot(), analyzer.zones)
+                annotated = render_annotated_frame(
+                    frame=frame,
+                    results=results,
+                    class_names=tracker.class_names,
+                    zones=analyzer.zones,
+                    view_mode="limpia",
+                    show_zones=True,
+                )
                 cv2.rectangle(annotated, (0, 0), (width, 40), (0, 0, 0), -1)
                 hud_text = (f"[{camera_id.upper()}] Jarras Lev: {analyzer.lifted} "
                             f"Dev: {analyzer.returned} | Total Obj Lev: {analyzer.total_lifted}")

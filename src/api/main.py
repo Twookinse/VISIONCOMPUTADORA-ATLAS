@@ -34,8 +34,27 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db, create_session_factory, PROJECT_ROOT
-from src.db.models import PipelineRun, KitchenEvent, save_report_to_db
+from src.db.models import (
+    PipelineRun,
+    KitchenEvent,
+    save_report_to_db,
+    MODE_DEMO,
+    MODE_LIVE,
+    MODE_VIDEO,
+    COUNTED_MODES,
+)
+from src.db.queries import (
+    FilterError,
+    SHIFTS,
+    apply_event_filters,
+    event_hour_expr,
+    get_jornada_start_hour,
+    jornada_bounds,
+    jornada_hour_order,
+)
+from src.utils.video_meta import resolve_video_start, compute_source_key
 from src.detection.tracker import Tracker
+from src.detection.visualizer import render_annotated_frame, save_event_snapshot, draw_clean_zones
 from src.events.zones import load_zones, draw_zones
 from src.analysis.kitchen import (
     KitchenAnalyzer,
@@ -51,6 +70,7 @@ from src.config.cameras import (
 )
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
+SNAPSHOTS_DIR = OUTPUT_DIR / "snapshots"
 VIDEOS_DIR = PROJECT_ROOT / "videos"
 DASHBOARD_DIST = PROJECT_ROOT / "dashboard" / "dist"
 
@@ -87,6 +107,17 @@ def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], z
     return resolved_cam_id, resolved_source, resolved_zones
 
 
+def _parse_video_start_or_400(source: str, video_start: Optional[str]):
+    """Resuelve la hora real de inicio del video; 400 si el usuario envio un valor invalido."""
+    start_dt, estimated = resolve_video_start(source, video_start)
+    if video_start and estimated:
+        raise HTTPException(
+            status_code=400,
+            detail="Fecha/hora de inicio invalida. Usa el formato YYYY-MM-DDTHH:MM",
+        )
+    return start_dt, estimated
+
+
 # =====================================================================
 # MOTOR DE MONITOREO EN TIEMPO REAL (Multi-Camara 720p RTSP / 1080p 60fps)
 # =====================================================================
@@ -99,6 +130,8 @@ class LiveMonitor:
         self.source = ""
         self.model_name = "models/custom/jarras_nex_v1.pt"
         self.zones_file = "config/zones/cocina_1.json"
+        self.view_mode = "limpia"   # "limpia", "solo_jarras", "tecnica"
+        self.show_zones = True
         self.resolution = "1280x720"
         self.fps_actual = 0.0
         self.lifted = 0
@@ -109,12 +142,21 @@ class LiveMonitor:
         self._thread = None
         self._lock = threading.Lock()
 
+    def set_display(self, view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
+        """Actualiza el modo visual en caliente sin reiniciar la camara."""
+        if view_mode in ("limpia", "solo_jarras", "tecnica"):
+            self.view_mode = view_mode
+        if show_zones is not None:
+            self.show_zones = bool(show_zones)
+
     def start(self, source: Optional[str] = None, camera_id: Optional[str] = None,
               model: str = "models/custom/jarras_nex_v1.pt",
-              zones: Optional[str] = None, confidence: float = 0.25):
+              zones: Optional[str] = None, confidence: float = 0.25,
+              view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
         if self.running:
             self.stop()
 
+        self.set_display(view_mode=view_mode, show_zones=show_zones)
         cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
 
         self.error = None
@@ -159,6 +201,8 @@ class LiveMonitor:
             "fuente": self.source,
             "modelo": self.model_name,
             "zonas": self.zones_file,
+            "view_mode": self.view_mode,
+            "show_zones": self.show_zones,
             "resolucion": self.resolution,
             "fps": round(self.fps_actual, 1),
             "jarras_levantadas_sesion": self.lifted,
@@ -217,11 +261,15 @@ class LiveMonitor:
 
             # Mostrar primer cuadro con las zonas de la camara mientras arranca YOLO
             ret0, first_frame = cap.read()
+            # Numerar frames desde la posicion real del video para que time_s sea correcto
+            frame_idx = 0 if is_live_camera else max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+            # Camara real (RTSP/USB) cuenta en las metricas; un video grabado es una demo
+            run_mode = MODE_LIVE if is_live_camera else MODE_DEMO
             if ret0:
-                preview = draw_zones(first_frame, zones)
-                cv2.rectangle(preview, (0, 0), (width, 40), (0, 0, 0), -1)
+                preview = draw_clean_zones(first_frame, zones, subtle=True) if self.show_zones else first_frame.copy()
+                cv2.rectangle(preview, (0, 0), (width, 40), (30, 34, 42), -1)
                 cv2.putText(preview, f"[{cam_id.upper()}] Iniciando modelo YOLO...",
-                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
                 self._encode_stream_frame(preview)
 
             tracker = Tracker(
@@ -240,6 +288,9 @@ class LiveMonitor:
                     source=f"EN_VIVO: {source_str}",
                     model=model_rel,
                     zones_file=zones_rel,
+                    mode=run_mode,
+                    video_start=datetime.now(),
+                    start_time_estimated=not is_live_camera,
                 )
                 db.add(live_run)
                 db.commit()
@@ -248,11 +299,12 @@ class LiveMonitor:
             finally:
                 db.close()
 
-            frame_idx = 0
             inferred_idx = 0
             t0 = time.time()
             last_event_text = ""
-            last_event_frame = -999
+            last_event_time = 0.0
+            # Resaltar durante 3 segundos cada objeto que acaba de cruzar una zona
+            recent_tracks = {}  # {track_id: (event_type, expire_ts)}
 
             while self.running:
                 if is_live_camera:
@@ -269,6 +321,7 @@ class LiveMonitor:
                     continue
 
                 inferred_idx += 1
+                now_ts = time.time()
                 results = tracker.track(frame)
                 new_events = analyzer.update(results, tracker.class_names, frame_idx, fps)
 
@@ -282,11 +335,19 @@ class LiveMonitor:
                         for ev in new_events:
                             action = "LEVANTADO" if ev.event_type == "salida" else "DEVUELTO"
                             last_event_text = f"{ev.class_name} #{ev.track_id} {action} ({ev.zone})"
-                            last_event_frame = frame_idx
+                            last_event_time = now_ts
+                            recent_tracks[ev.track_id] = (ev.event_type, now_ts + 3.0)
+
+                            snap_file = save_event_snapshot(
+                                frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
+                            )
+                            ev.snapshot_file = snap_file
+
                             db.add(KitchenEvent(
                                 run_id=run_id,
                                 created_at=datetime.now(),
                                 camera_id=cam_id,
+                                mode=run_mode,
                                 source=str(source_str),
                                 frame=ev.frame,
                                 time_s=ev.time_s,
@@ -294,6 +355,7 @@ class LiveMonitor:
                                 class_name=ev.class_name,
                                 zone=ev.zone,
                                 event_type=ev.event_type,
+                                snapshot_file=snap_file,
                             ))
                         run_obj = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
                         if run_obj:
@@ -306,18 +368,40 @@ class LiveMonitor:
                     finally:
                         db.close()
 
-                annotated = draw_zones(_clean_plot(results), analyzer.zones)
-                cv2.rectangle(annotated, (0, 0), (width, 40), (0, 0, 0), -1)
-                elapsed = max(0.1, time.time() - t0)
-                self.fps_actual = inferred_idx / elapsed
-                hud = (f"[{cam_id.upper()}] {width}x{height} ({self.fps_actual:.1f} FPS) | "
-                       f"Jarras Lev: {analyzer.lifted} | Total Obj Lev: {analyzer.total_lifted}")
-                cv2.putText(annotated, hud, (10, 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # Limpiar resaltados vencidos
+                active_recent = {
+                    tid: ev_type
+                    for tid, (ev_type, exp) in recent_tracks.items()
+                    if exp > now_ts
+                }
 
-                if frame_idx - last_event_frame < fps * 2.0:
-                    cv2.putText(annotated, last_event_text, (10, 74),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
+                annotated = render_annotated_frame(
+                    frame=frame,
+                    results=results,
+                    class_names=tracker.class_names,
+                    zones=analyzer.zones,
+                    view_mode=self.view_mode,
+                    show_zones=self.show_zones,
+                    recent_track_events=active_recent,
+                )
+
+                cv2.rectangle(annotated, (0, 0), (width, 40), (30, 34, 42), -1)
+                elapsed = max(0.1, now_ts - t0)
+                self.fps_actual = inferred_idx / elapsed
+                mode_label = {
+                    "limpia": "VISTA LIMPIA",
+                    "solo_jarras": "SOLO JARRAS",
+                    "tecnica": "VISTA TECNICA",
+                }.get(self.view_mode, self.view_mode.upper())
+                hud = (f"[{cam_id.upper()} | {mode_label}] {self.fps_actual:.1f} FPS | "
+                       f"Jarras Lev: {analyzer.lifted} | Total Obj Lev: {analyzer.total_lifted}")
+                cv2.putText(annotated, hud, (10, 27),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
+
+                if last_event_text and (now_ts - last_event_time) < 3.0:
+                    cv2.rectangle(annotated, (8, 46), (min(width - 8, 680), 82), (62, 62, 249), -1)
+                    cv2.putText(annotated, f"EVENTO: {last_event_text}", (16, 71),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
                 self._encode_stream_frame(annotated)
 
@@ -351,7 +435,8 @@ class PipelineJobManager:
     def start(self, source: str, camera_id: Optional[str] = None,
               model: str = "models/custom/jarras_nex_v1.pt",
               zones: Optional[str] = None, confidence: float = 0.25,
-              min_frames: int = 4, skip_frames: int = 0, max_seconds: float = 0.0):
+              min_frames: int = 4, skip_frames: int = 0, max_seconds: float = 0.0,
+              video_start: Optional[str] = None):
         if self.running:
             raise HTTPException(status_code=409, detail="Ya hay un video analizandose en este momento")
 
@@ -359,6 +444,7 @@ class PipelineJobManager:
         source_path = PROJECT_ROOT / resolved_src
         if not source_path.exists():
             raise HTTPException(status_code=404, detail=f"No se encontro el video '{resolved_src}'")
+        start_dt, start_estimated = _parse_video_start_or_400(resolved_src, video_start)
 
         self.running = True
         self.cancel_requested = False
@@ -374,7 +460,8 @@ class PipelineJobManager:
 
         self._thread = threading.Thread(
             target=self._run_job,
-            args=(cam_id, resolved_src, model, resolved_zones, confidence, min_frames, skip_frames, max_seconds),
+            args=(cam_id, resolved_src, model, resolved_zones, confidence, min_frames, skip_frames,
+                  max_seconds, start_dt, start_estimated),
             daemon=True,
         )
         self._thread.start()
@@ -396,7 +483,8 @@ class PipelineJobManager:
             "error": self.error,
         }
 
-    def _run_job(self, cam_id, source_rel, model_rel, zones_rel, confidence, min_frames, skip_frames, max_seconds):
+    def _run_job(self, cam_id, source_rel, model_rel, zones_rel, confidence, min_frames, skip_frames,
+                 max_seconds, start_dt, start_estimated):
         try:
             zones = load_zones(PROJECT_ROOT / zones_rel)
             if not zones:
@@ -437,7 +525,11 @@ class PipelineJobManager:
                     if frame_count % eff_skip != 0:
                         continue
                     results = tracker.track(frame)
-                    analyzer.update(results, tracker.class_names, frame_count, fps)
+                    new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
+                    for ev in new_events:
+                        ev.snapshot_file = save_event_snapshot(
+                            frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
+                        )
                     self.events_found = len(analyzer.events)
                     self.jarras_found = analyzer.lifted
             finally:
@@ -453,6 +545,10 @@ class PipelineJobManager:
                 "duracion_video_s": round(frame_count / fps, 1),
                 "tiempo_proceso_s": round(elapsed, 1),
                 "cancelado": self.cancel_requested,
+                "modo": MODE_VIDEO,
+                "inicio_grabacion": start_dt.isoformat(),
+                "inicio_estimado": start_estimated,
+                "source_key": compute_source_key(PROJECT_ROOT / source_rel),
                 **analyzer.summary(),
             }
 
@@ -529,6 +625,7 @@ class PipelineRunRequest(BaseModel):
     skip_frames: int = 0
     max_seconds: float = 0.0
     classes: Optional[List[str]] = None
+    video_start: Optional[str] = None  # Hora real de inicio de la grabacion (YYYY-MM-DDTHH:MM)
 
 
 class LiveStartRequest(BaseModel):
@@ -537,6 +634,13 @@ class LiveStartRequest(BaseModel):
     model: str = "models/custom/jarras_nex_v1.pt"
     zones: Optional[str] = None
     confidence: float = 0.25
+    view_mode: Optional[str] = "limpia"
+    show_zones: Optional[bool] = True
+
+
+class LiveDisplayRequest(BaseModel):
+    view_mode: Optional[str] = None
+    show_zones: Optional[bool] = None
 
 
 class CameraUpdateRequest(BaseModel):
@@ -573,8 +677,10 @@ def list_available_videos():
             for f in sorted(VIDEOS_DIR.glob(ext)):
                 rel = f"videos/{f.name}"
                 cam = detect_camera_for_source(rel)
+                start_dt, start_estimated = resolve_video_start(f.name)
                 videos.append(rel)
                 videos_detail.append({
+                    "inicio_detectado": None if start_estimated else start_dt.isoformat(timespec="minutes"),
                     "path": rel,
                     "name": f.name,
                     "camera_id": cam["id"] if cam else "cocina_1",
@@ -600,43 +706,45 @@ async def upload_video(file: UploadFile = File(...)):
     }
 
 
+@app.get("/api/shifts")
+def list_shifts():
+    """Turnos disponibles y hora de inicio de la jornada (config/cameras.json)."""
+    return {
+        "jornada_inicio_hora": get_jornada_start_hour(),
+        "turnos": {k: {"label": v["label"], "horas": v["hours"]} for k, v in SHIFTS.items()},
+    }
+
+
 @app.get("/api/events")
 def list_events(
     camera_id: Optional[str] = Query(None, description="Filtrar por camara: cocina_1, cocina_2, almacen"),
-    date: Optional[str] = Query(None, description="Filtrar por fecha YYYY-MM-DD"),
+    date: Optional[str] = Query(None, description="Filtrar por JORNADA YYYY-MM-DD (de 08:00 a 07:59 del dia siguiente)"),
+    shift: Optional[str] = Query(None, description="Turno: todos, dia, tarde, noche"),
     class_name: Optional[str] = Query(None, description="Filtrar por clase (ej: Jarra, Taper, Olla)"),
     event_type: Optional[str] = Query(None, description="Filtrar por tipo: 'salida' o 'entrada'"),
     zone: Optional[str] = Query(None, description="Filtrar por nombre de zona ROI"),
+    include_demo: bool = Query(False, description="Incluir reproducciones con marcas de videos (demo)"),
     limit: int = Query(300, ge=1, le=2000, description="Maximo de eventos a devolver"),
     db: Session = Depends(get_db),
 ):
-    """Lista los eventos registrados en SQLite con filtros opcionales."""
-    query = db.query(KitchenEvent)
+    """Lista los eventos registrados en SQLite con filtros opcionales.
 
-    if camera_id:
-        query = query.filter(KitchenEvent.camera_id == camera_id)
+    'total' es la cantidad real de eventos que cumplen el filtro; 'mostrados'
+    la cantidad devuelta en esta respuesta (limitada por 'limit').
+    """
+    try:
+        query = apply_event_filters(
+            db.query(KitchenEvent), camera_id=camera_id, date=date, shift=shift,
+            class_name=class_name, event_type=event_type, zone=zone, include_demo=include_demo,
+        )
+    except FilterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Usa YYYY-MM-DD")
-        start_dt = datetime.combine(target_date, datetime.min.time())
-        end_dt = datetime.combine(target_date, datetime.max.time())
-        query = query.filter(KitchenEvent.created_at >= start_dt, KitchenEvent.created_at <= end_dt)
-
-    if class_name:
-        query = query.filter(KitchenEvent.class_name == class_name)
-
-    if event_type:
-        query = query.filter(KitchenEvent.event_type == event_type)
-
-    if zone:
-        query = query.filter(KitchenEvent.zone == zone)
-
-    events = query.order_by(KitchenEvent.id.desc()).limit(limit).all()
+    total = query.count()
+    events = query.order_by(KitchenEvent.created_at.desc(), KitchenEvent.id.desc()).limit(limit).all()
     return {
-        "total": len(events),
+        "total": total,
+        "mostrados": len(events),
         "eventos": [e.to_dict() for e in events],
     }
 
@@ -644,29 +752,36 @@ def list_events(
 @app.get("/api/metrics/hourly")
 def hourly_metrics(
     camera_id: Optional[str] = Query(None, description="Filtrar por camara: cocina_1, cocina_2, almacen"),
-    date: Optional[str] = Query(None, description="Filtrar por fecha YYYY-MM-DD"),
+    date: Optional[str] = Query(None, description="Filtrar por JORNADA YYYY-MM-DD (de 08:00 a 07:59 del dia siguiente)"),
+    shift: Optional[str] = Query(None, description="Turno: todos, dia, tarde, noche"),
     class_name: Optional[str] = Query(None, description="Filtrar por clase especifica (ej: Jarra)"),
+    include_demo: bool = Query(False, description="Incluir reproducciones con marcas de videos (demo)"),
     db: Session = Depends(get_db),
 ):
-    """Devuelve conteos agrupados por hora, por clase y por zona."""
-    query = db.query(KitchenEvent)
+    """Devuelve los KPIs y conteos agrupados por hora, clase y zona (calculados en SQL).
 
-    if camera_id:
-        query = query.filter(KitchenEvent.camera_id == camera_id)
+    Los totales consideran TODOS los eventos del filtro (sin limite de cantidad).
+    'por_hora' viene ordenado desde la hora de inicio de la jornada.
+    """
+    hour_col = event_hour_expr().label("hora")
+    try:
+        query = apply_event_filters(
+            db.query(
+                hour_col,
+                KitchenEvent.class_name,
+                KitchenEvent.zone,
+                KitchenEvent.event_type,
+                func.count(KitchenEvent.id),
+            ),
+            camera_id=camera_id, date=date, shift=shift,
+            class_name=class_name, include_demo=include_demo,
+        )
+    except FilterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Usa YYYY-MM-DD")
-        start_dt = datetime.combine(target_date, datetime.min.time())
-        end_dt = datetime.combine(target_date, datetime.max.time())
-        query = query.filter(KitchenEvent.created_at >= start_dt, KitchenEvent.created_at <= end_dt)
-
-    if class_name:
-        query = query.filter(KitchenEvent.class_name == class_name)
-
-    events = query.all()
+    rows = query.group_by(
+        hour_col, KitchenEvent.class_name, KitchenEvent.zone, KitchenEvent.event_type
+    ).all()
 
     hourly = {
         h: {
@@ -679,53 +794,52 @@ def hourly_metrics(
         }
         for h in range(24)
     }
-
     totales_por_clase = {}
     totales_por_zona = {}
 
-    for ev in events:
-        hour = ev.created_at.hour if ev.created_at else 0
-        bucket = hourly[hour]
-        cls_bucket = bucket["por_clase"].setdefault(
-            ev.class_name, {"levantados": 0, "devueltos": 0}
-        )
-        cls_total = totales_por_clase.setdefault(
-            ev.class_name, {"levantados": 0, "devueltos": 0}
-        )
-        zone_total = totales_por_zona.setdefault(
-            ev.zone, {"levantados": 0, "devueltos": 0}
-        )
-
-        if ev.event_type == "salida":
-            bucket["objetos_levantados"] += 1
-            cls_bucket["levantados"] += 1
-            cls_total["levantados"] += 1
-            zone_total["levantados"] += 1
-            if ev.class_name in JAR_ONLY_CLASSES:
-                bucket["jarras_levantadas"] += 1
+    for hour, cls_name, zone_name, ev_type, count in rows:
+        bucket = hourly[int(hour or 0) % 24]
+        key = "levantados" if ev_type == "salida" else "devueltos"
+        is_jar = cls_name in JAR_ONLY_CLASSES
+        for target in (
+            bucket["por_clase"].setdefault(cls_name, {"levantados": 0, "devueltos": 0}),
+            totales_por_clase.setdefault(cls_name, {"levantados": 0, "devueltos": 0}),
+            totales_por_zona.setdefault(zone_name, {"levantados": 0, "devueltos": 0}),
+        ):
+            target[key] += count
+        if ev_type == "salida":
+            bucket["objetos_levantados"] += count
+            if is_jar:
+                bucket["jarras_levantadas"] += count
         else:
-            bucket["objetos_devueltos"] += 1
-            cls_bucket["devueltos"] += 1
-            cls_total["devueltos"] += 1
-            zone_total["devueltos"] += 1
-            if ev.class_name in JAR_ONLY_CLASSES:
-                bucket["jarras_devueltas"] += 1
+            bucket["objetos_devueltos"] += count
+            if is_jar:
+                bucket["jarras_devueltas"] += count
 
-    active_hours = [
-        b for b in hourly.values()
-        if b["objetos_levantados"] > 0 or b["objetos_devueltos"] > 0
-    ]
+    ordered = [hourly[h] for h in jornada_hour_order()]
+    active_hours = [b for b in ordered if b["objetos_levantados"] or b["objetos_devueltos"]]
+    jornada = None
+    if date:
+        j_start, j_end = jornada_bounds(date)
+        jornada = {"inicio": j_start.isoformat(), "fin": j_end.isoformat()}
 
+    objetos_lev = sum(b["objetos_levantados"] for b in ordered)
+    objetos_dev = sum(b["objetos_devueltos"] for b in ordered)
     return {
         "camera_id": camera_id or "todas",
         "fecha": date or "todas",
+        "jornada": jornada,
+        "turno": shift or "todos",
         "clase_filtro": class_name or "todas",
-        "jarras_levantadas_total": sum(b["jarras_levantadas"] for b in hourly.values()),
-        "objetos_levantados_total": sum(b["objetos_levantados"] for b in hourly.values()),
+        "jarras_levantadas_total": sum(b["jarras_levantadas"] for b in ordered),
+        "jarras_devueltas_total": sum(b["jarras_devueltas"] for b in ordered),
+        "objetos_levantados_total": objetos_lev,
+        "objetos_devueltos_total": objetos_dev,
+        "total_eventos": objetos_lev + objetos_dev,
         "totales_por_clase": totales_por_clase,
         "totales_por_zona": totales_por_zona,
         "horas_con_actividad": active_hours,
-        "por_hora": list(hourly.values()),
+        "por_hora": ordered,
     }
 
 
@@ -799,6 +913,16 @@ def save_camera_rtsp_endpoint(camera_id: str, req: CameraUpdateRequest):
     }
 
 
+@app.get("/api/snapshots/{filename}")
+def get_event_snapshot(filename: str):
+    """Sirve la foto de evidencia (snapshot) capturada en el instante de un evento."""
+    safe_name = Path(filename).name
+    file_path = SNAPSHOTS_DIR / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Captura no encontrada")
+    return FileResponse(str(file_path), media_type="image/jpeg")
+
+
 @app.post("/api/live/start")
 def start_live_monitoring(req: LiveStartRequest):
     """Inicia el monitoreo/reproduccion con marcas para una camara de Nex."""
@@ -808,8 +932,17 @@ def start_live_monitoring(req: LiveStartRequest):
         model=req.model,
         zones=req.zones,
         confidence=req.confidence,
+        view_mode=req.view_mode,
+        show_zones=req.show_zones,
     )
     return {"mensaje": "Monitoreo en tiempo real iniciado", "estado": live_monitor.status()}
+
+
+@app.post("/api/live/display")
+def update_live_display(req: LiveDisplayRequest):
+    """Cambia en caliente el modo visual (limpia/solo_jarras/tecnica) y visibilidad de zonas."""
+    live_monitor.set_display(view_mode=req.view_mode, show_zones=req.show_zones)
+    return {"mensaje": "Modo visual actualizado", "estado": live_monitor.status()}
 
 
 @app.post("/api/live/stop")
@@ -926,7 +1059,11 @@ def run_pipeline_endpoint(req: PipelineRunRequest):
             if frame_count % eff_skip != 0:
                 continue
             results = tracker.track(frame)
-            analyzer.update(results, tracker.class_names, frame_count, fps)
+            new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
+            for ev in new_events:
+                ev.snapshot_file = save_event_snapshot(
+                    frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
+                )
     finally:
         cap.release()
 

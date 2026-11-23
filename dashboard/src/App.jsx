@@ -37,9 +37,12 @@ export default function App() {
   const [cameraFilter, setCameraFilter] = useState('')
   const [activeCamId, setActiveCamId] = useState('cocina_1')
 
-  // Controles de video y RTSP
+  // Controles de video, visualizacion limpia y RTSP
   const [selectedVideo, setSelectedVideo] = useState('')
   const [rtspDraft, setRtspDraft] = useState('')
+  const [viewMode, setViewMode] = useState('limpia')
+  const [showZones, setShowZones] = useState(true)
+  const [modalEvent, setModalEvent] = useState(null)
   const [uploadingVideo, setUploadingVideo] = useState(false)
   const [actionMsg, setActionMsg] = useState('')
   const [lastReport, setLastReport] = useState(null)
@@ -91,7 +94,10 @@ export default function App() {
         }
       }
       if (liveRes.ok) {
-        setLiveStatus(await liveRes.json())
+        const lData = await liveRes.json()
+        setLiveStatus(lData)
+        if (lData.view_mode) setViewMode(lData.view_mode)
+        if (typeof lData.show_zones === 'boolean') setShowZones(lData.show_zones)
       }
       if (jobRes.ok) {
         const jData = await jobRes.json()
@@ -190,6 +196,35 @@ export default function App() {
     }
   }
 
+  // Cerrar visor de foto con tecla Escape
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') setModalEvent(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  const handleDisplayChange = async (newMode, newShowZones) => {
+    const targetMode = newMode !== undefined ? newMode : viewMode
+    const targetZones = newShowZones !== undefined ? newShowZones : showZones
+    setViewMode(targetMode)
+    setShowZones(targetZones)
+    try {
+      const res = await fetch(`${API_BASE}/api/live/display`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ view_mode: targetMode, show_zones: targetZones }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setLiveStatus(data.estado)
+      }
+    } catch (e) {
+      // Silencioso si la vista no esta activa aun
+    }
+  }
+
   const handleStartLive = async (sourceToUse, camIdOverride = null) => {
     const targetCam = camIdOverride || activeCamId
     const src = (sourceToUse || '').trim()
@@ -201,13 +236,25 @@ export default function App() {
     }
     setActiveCamId(targetCam)
     setActionMsg(`Abriendo vista con marcas para ${CAMERA_LABELS[targetCam] || targetCam}: "${src}"...`)
-    setLiveStatus({ activo: true, camera_id: targetCam, fuente: src, resolucion: 'Cargando...' })
+    setLiveStatus({
+      activo: true,
+      camera_id: targetCam,
+      fuente: src,
+      resolucion: 'Cargando...',
+      view_mode: viewMode,
+      show_zones: showZones,
+    })
     setStreamKey(Date.now())
     try {
       const res = await fetch(`${API_BASE}/api/live/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: src, camera_id: targetCam }),
+        body: JSON.stringify({
+          source: src,
+          camera_id: targetCam,
+          view_mode: viewMode,
+          show_zones: showZones,
+        }),
       })
       const data = await res.json()
       setLiveStatus(data.estado || { activo: true, camera_id: targetCam, fuente: src })
@@ -571,26 +618,58 @@ export default function App() {
           </div>
         )}
 
-        {/* Reproductor MJPEG en vivo con selector rapido de cambio de camara */}
+        {/* Reproductor MJPEG en vivo con selector de camara y modo visual limpio */}
         {liveStatus.activo && (
           <div className="live-stream-box">
             <div className="live-stream-header">
               <div>
                 <strong>
-                  Vista con Marcas [{CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id}] —{' '}
+                  Vista en Directo [{CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id}] —{' '}
                   {liveStatus.fuente.replace('videos/', '')} ({liveStatus.resolucion})
                 </strong>
-                <div className="live-quick-switch">
-                  <span>Cambiar camara en vivo:</span>
-                  {cameras.map((c) => (
+                <div className="live-controls-bar">
+                  <div className="live-quick-switch">
+                    <span>Camara:</span>
+                    {cameras.map((c) => (
+                      <button
+                        key={c.id}
+                        className={`btn-mini ${liveStatus.camera_id === c.id ? 'active' : ''}`}
+                        onClick={() => handleStartLive(c.rtsp_url || c.default_video, c.id)}
+                      >
+                        {CAMERA_LABELS[c.id] || c.nombre}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="live-quick-switch">
+                    <span>Modo visual:</span>
                     <button
-                      key={c.id}
-                      className={`btn-mini ${liveStatus.camera_id === c.id ? 'active' : ''}`}
-                      onClick={() => handleStartLive(c.rtsp_url || c.default_video, c.id)}
+                      className={`btn-mini ${viewMode === 'limpia' ? 'active-blue' : ''}`}
+                      title="Oculta cajas amontonadas, resalta Jarras y eventos recientes"
+                      onClick={() => handleDisplayChange('limpia', showZones)}
                     >
-                      {CAMERA_LABELS[c.id] || c.nombre}
+                      Vista Limpia
                     </button>
-                  ))}
+                    <button
+                      className={`btn-mini ${viewMode === 'solo_jarras' ? 'active-blue' : ''}`}
+                      title="Muestra unicamente Jarras y el objeto que acaba de moverse"
+                      onClick={() => handleDisplayChange('solo_jarras', showZones)}
+                    >
+                      Solo Jarras
+                    </button>
+                    <button
+                      className={`btn-mini ${viewMode === 'tecnica' ? 'active-blue' : ''}`}
+                      title="Muestra todas las detecciones y porcentajes (modo tecnico)"
+                      onClick={() => handleDisplayChange('tecnica', showZones)}
+                    >
+                      Vista Tecnica
+                    </button>
+                    <button
+                      className={`btn-mini ${showZones ? 'active' : ''}`}
+                      onClick={() => handleDisplayChange(viewMode, !showZones)}
+                    >
+                      Zonas ROI: {showZones ? 'SI' : 'NO'}
+                    </button>
+                  </div>
                 </div>
               </div>
               <button className="btn-danger" onClick={handleStopLive}>
@@ -842,7 +921,8 @@ export default function App() {
                   <th>Track</th>
                   <th>Movimiento</th>
                   <th>Zona ROI</th>
-                  <th>Momento en Video</th>
+                  <th>Momento</th>
+                  <th>Evidencia</th>
                   <th>Fecha y Hora</th>
                 </tr>
               </thead>
@@ -873,6 +953,18 @@ export default function App() {
                       {ev.time_s}s (f.{ev.frame})
                     </td>
                     <td>
+                      {ev.snapshot_url ? (
+                        <button
+                          className="btn-snapshot"
+                          onClick={() => setModalEvent(ev)}
+                        >
+                          Ver Foto
+                        </button>
+                      ) : (
+                        <span className="muted-sm">-</span>
+                      )}
+                    </td>
+                    <td>
                       {ev.created_at
                         ? new Date(ev.created_at).toLocaleString('es-BO')
                         : '-'}
@@ -884,6 +976,34 @@ export default function App() {
           </div>
         )}
       </section>
+
+      {/* VISOR MODAL DE FOTO DE EVIDENCIA (SNAPSHOT) */}
+      {modalEvent && (
+        <div className="modal-backdrop" onClick={() => setModalEvent(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h3>
+                  Evidencia #{modalEvent.id} — {modalEvent.class_name} (#{modalEvent.track_id})
+                </h3>
+                <p className="subtitle">
+                  {CAMERA_LABELS[modalEvent.camera_id] || modalEvent.camera_id} ·{' '}
+                  {modalEvent.event_type === 'salida' ? 'LEVANTADO (Salida)' : 'DEVUELTO (Entrada)'} · Zona:{' '}
+                  <strong>{modalEvent.zone}</strong> · Segundo {modalEvent.time_s}s
+                </p>
+              </div>
+              <button className="btn-danger" onClick={() => setModalEvent(null)}>
+                Cerrar
+              </button>
+            </div>
+            <img
+              src={`${API_BASE}${modalEvent.snapshot_url}`}
+              alt={`Captura del evento ${modalEvent.id}`}
+              className="modal-snapshot-img"
+            />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
