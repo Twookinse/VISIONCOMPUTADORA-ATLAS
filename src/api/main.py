@@ -15,7 +15,6 @@ Incluye:
 
 import asyncio
 import json
-import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -24,7 +23,6 @@ from pathlib import Path
 from typing import Optional, List
 
 import cv2
-import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
@@ -38,10 +36,7 @@ from src.db.models import (
     PipelineRun,
     KitchenEvent,
     save_report_to_db,
-    MODE_DEMO,
-    MODE_LIVE,
     MODE_VIDEO,
-    COUNTED_MODES,
 )
 from src.db.queries import (
     FilterError,
@@ -54,13 +49,13 @@ from src.db.queries import (
 )
 from src.utils.video_meta import resolve_video_start, compute_source_key
 from src.detection.tracker import Tracker
-from src.detection.visualizer import render_annotated_frame, save_event_snapshot, draw_clean_zones
-from src.events.zones import load_zones, draw_zones
+from src.detection.visualizer import save_event_snapshot
+from src.events.zones import load_zones
+from src.live.monitor import LiveMonitor
 from src.analysis.kitchen import (
     KitchenAnalyzer,
     DEFAULT_JAR_CLASSES,
     JAR_ONLY_CLASSES,
-    normalize_class_name,
 )
 from src.config.cameras import (
     InvalidRtspUrl,
@@ -89,19 +84,6 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 SNAPSHOTS_DIR = OUTPUT_DIR / "snapshots"
 VIDEOS_DIR = PROJECT_ROOT / "videos"
 DASHBOARD_DIST = PROJECT_ROOT / "dashboard" / "dist"
-
-
-def _clean_plot(results):
-    """Dibuja las detecciones usando los nombres normalizados (ej. Jarra en vez de Jarra2)."""
-    orig_names = results.names
-    try:
-        results.names = {
-            k: (normalize_class_name(v) or v)
-            for k, v in orig_names.items()
-        }
-        return results.plot()
-    finally:
-        results.names = orig_names
 
 
 def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], zones_override: Optional[str]):
@@ -155,301 +137,6 @@ def _parse_video_start_or_400(source: str, video_start: Optional[str]):
             detail="Fecha/hora de inicio invalida. Usa el formato YYYY-MM-DDTHH:MM",
         )
     return start_dt, estimated
-
-
-# =====================================================================
-# MOTOR DE MONITOREO EN TIEMPO REAL (Multi-Camara 720p RTSP / 1080p 60fps)
-# =====================================================================
-class LiveMonitor:
-    """Gestiona la captura, visualizacion con marcas y conteo en tiempo real."""
-
-    def __init__(self):
-        self.running = False
-        self.camera_id = "cocina_1"
-        self.source = ""
-        self.model_name = "models/custom/jarras_nex_v1.pt"
-        self.zones_file = "config/zones/cocina_1.json"
-        self.view_mode = "limpia"   # "limpia", "solo_jarras", "tecnica"
-        self.show_zones = True
-        self.resolution = "1280x720"
-        self.fps_actual = 0.0
-        self.lifted = 0
-        self.returned = 0
-        self.total_lifted = 0
-        self.latest_jpeg = None
-        self.error = None
-        self._thread = None
-        self._lock = threading.Lock()
-
-    def set_display(self, view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
-        """Actualiza el modo visual en caliente sin reiniciar la camara."""
-        if view_mode in ("limpia", "solo_jarras", "tecnica"):
-            self.view_mode = view_mode
-        if show_zones is not None:
-            self.show_zones = bool(show_zones)
-
-    def start(self, source: Optional[str] = None, camera_id: Optional[str] = None,
-              model: str = "models/custom/jarras_nex_v1.pt",
-              zones: Optional[str] = None, confidence: float = 0.25,
-              view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
-        if self.running:
-            self.stop()
-
-        self.set_display(view_mode=view_mode, show_zones=show_zones)
-        cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
-
-        self.error = None
-        self.camera_id = cam_id
-        self.source = mask_rtsp_url(resolved_src)  # Nunca exponer la clave del DVR
-        self.model_name = model
-        self.zones_file = resolved_zones
-        self.lifted = 0
-        self.returned = 0
-        self.total_lifted = 0
-        self.fps_actual = 0.0
-
-        # Cuadro inicial inmediato mientras carga el modelo YOLO
-        placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
-        cv2.putText(placeholder, f"Cargando camara {cam_id.upper()} y detector YOLO...",
-                    (50, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
-        cv2.putText(placeholder, f"Fuente: {self.source}",
-                    (50, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1)
-        ok, buf = cv2.imencode(".jpg", placeholder)
-        if ok:
-            with self._lock:
-                self.latest_jpeg = buf.tobytes()
-
-        self.running = True
-        self._thread = threading.Thread(
-            target=self._worker,
-            args=(cam_id, resolved_src, model, resolved_zones, confidence),
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self):
-        self.running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
-        self._thread = None
-
-    def status(self):
-        return {
-            "activo": self.running,
-            "camera_id": self.camera_id,
-            "fuente": self.source,
-            "modelo": self.model_name,
-            "zonas": self.zones_file,
-            "view_mode": self.view_mode,
-            "show_zones": self.show_zones,
-            "resolucion": self.resolution,
-            "fps": round(self.fps_actual, 1),
-            "jarras_levantadas_sesion": self.lifted,
-            "jarras_devueltas_sesion": self.returned,
-            "objetos_levantados_sesion": self.total_lifted,
-            "error": self.error,
-        }
-
-    def _encode_stream_frame(self, annotated):
-        """Redimensiona suavemente a max 960px de ancho para streaming MJPEG rapido."""
-        h, w = annotated.shape[:2]
-        if w > 960:
-            scale = 960.0 / w
-            annotated = cv2.resize(annotated, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
-        ok, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ok:
-            with self._lock:
-                self.latest_jpeg = buffer.tobytes()
-
-    def _worker(self, cam_id: str, source_str: str, model_rel: str, zones_rel: str, confidence: float):
-        try:
-            zones = load_zones(PROJECT_ROOT / zones_rel)
-
-            if str(source_str).lower().startswith("rtsp://"):
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer"
-                cap_source = source_str
-                is_live_camera = True
-            elif str(source_str).isdigit():
-                cap_source = int(source_str)
-                is_live_camera = True
-            else:
-                full_path = PROJECT_ROOT / source_str
-                cap_source = str(full_path if full_path.exists() else source_str)
-                is_live_camera = False
-
-            public_src = mask_rtsp_url(source_str)
-            cap = cv2.VideoCapture(cap_source)
-            if not cap.isOpened():
-                self.error = f"No se pudo abrir la fuente: {public_src}"
-                self.running = False
-                return
-
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if isinstance(cap_source, int):
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-            self.resolution = f"{width}x{height}"
-
-            # Si es video grabado a 60fps de Nex, saltar los primeros segundos del logo DVR
-            if not is_live_camera and fps >= 45:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 180)
-            skip_frames = 3 if (not is_live_camera and fps >= 45) else 1
-
-            # Mostrar primer cuadro con las zonas de la camara mientras arranca YOLO
-            ret0, first_frame = cap.read()
-            # Numerar frames desde la posicion real del video para que time_s sea correcto
-            frame_idx = 0 if is_live_camera else max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
-            # Camara real (RTSP/USB) cuenta en las metricas; un video grabado es una demo
-            run_mode = MODE_LIVE if is_live_camera else MODE_DEMO
-            if ret0:
-                preview = draw_clean_zones(first_frame, zones, subtle=True) if self.show_zones else first_frame.copy()
-                cv2.rectangle(preview, (0, 0), (width, 40), (30, 34, 42), -1)
-                cv2.putText(preview, f"[{cam_id.upper()}] Iniciando modelo YOLO...",
-                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
-                self._encode_stream_frame(preview)
-
-            tracker = Tracker(
-                model_path=PROJECT_ROOT / model_rel,
-                confidence=confidence,
-                tracker_type=str(PROJECT_ROOT / "config/trackers/bytetrack_cocina.yaml"),
-            )
-            analyzer = KitchenAnalyzer(zones, jar_classes=None, min_frames=4)
-
-            session_local = create_session_factory()
-            db = session_local()
-            try:
-                live_run = PipelineRun(
-                    created_at=datetime.now(),
-                    camera_id=cam_id,
-                    source=f"EN_VIVO: {public_src}",
-                    model=model_rel,
-                    zones_file=zones_rel,
-                    mode=run_mode,
-                    video_start=datetime.now(),
-                    start_time_estimated=not is_live_camera,
-                )
-                db.add(live_run)
-                db.commit()
-                db.refresh(live_run)
-                run_id = live_run.id
-            finally:
-                db.close()
-
-            inferred_idx = 0
-            t0 = time.time()
-            last_event_text = ""
-            last_event_time = 0.0
-            # Resaltar durante 3 segundos cada objeto que acaba de cruzar una zona
-            recent_tracks = {}  # {track_id: (event_type, expire_ts)}
-
-            while self.running:
-                if is_live_camera:
-                    cap.grab()
-                ret, frame = cap.retrieve() if is_live_camera else cap.read()
-                if not ret:
-                    if not is_live_camera:
-                        break
-                    time.sleep(0.05)
-                    continue
-
-                frame_idx += 1
-                if not is_live_camera and frame_idx % skip_frames != 0:
-                    continue
-
-                inferred_idx += 1
-                now_ts = time.time()
-                results = tracker.track(frame)
-                new_events = analyzer.update(results, tracker.class_names, frame_idx, fps)
-
-                self.lifted = analyzer.lifted
-                self.returned = analyzer.returned
-                self.total_lifted = analyzer.total_lifted
-
-                if new_events:
-                    db = session_local()
-                    try:
-                        for ev in new_events:
-                            action = "LEVANTADO" if ev.event_type == "salida" else "DEVUELTO"
-                            last_event_text = f"{ev.class_name} #{ev.track_id} {action} ({ev.zone})"
-                            last_event_time = now_ts
-                            recent_tracks[ev.track_id] = (ev.event_type, now_ts + 3.0)
-
-                            snap_file = save_event_snapshot(
-                                frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
-                            )
-                            ev.snapshot_file = snap_file
-
-                            db.add(KitchenEvent(
-                                run_id=run_id,
-                                created_at=datetime.now(),
-                                camera_id=cam_id,
-                                mode=run_mode,
-                                source=public_src,
-                                frame=ev.frame,
-                                time_s=ev.time_s,
-                                track_id=ev.track_id,
-                                class_name=ev.class_name,
-                                zone=ev.zone,
-                                event_type=ev.event_type,
-                                snapshot_file=snap_file,
-                            ))
-                        run_obj = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
-                        if run_obj:
-                            run_obj.frames_processed = frame_idx
-                            run_obj.jarras_levantadas = analyzer.lifted
-                            run_obj.jarras_devueltas = analyzer.returned
-                            run_obj.objetos_levantados_total = analyzer.total_lifted
-                            run_obj.objetos_devueltos_total = analyzer.total_returned
-                        db.commit()
-                    finally:
-                        db.close()
-
-                # Limpiar resaltados vencidos
-                active_recent = {
-                    tid: ev_type
-                    for tid, (ev_type, exp) in recent_tracks.items()
-                    if exp > now_ts
-                }
-
-                annotated = render_annotated_frame(
-                    frame=frame,
-                    results=results,
-                    class_names=tracker.class_names,
-                    zones=analyzer.zones,
-                    view_mode=self.view_mode,
-                    show_zones=self.show_zones,
-                    recent_track_events=active_recent,
-                )
-
-                cv2.rectangle(annotated, (0, 0), (width, 40), (30, 34, 42), -1)
-                elapsed = max(0.1, now_ts - t0)
-                self.fps_actual = inferred_idx / elapsed
-                mode_label = {
-                    "limpia": "VISTA LIMPIA",
-                    "solo_jarras": "SOLO JARRAS",
-                    "tecnica": "VISTA TECNICA",
-                }.get(self.view_mode, self.view_mode.upper())
-                hud = (f"[{cam_id.upper()} | {mode_label}] {self.fps_actual:.1f} FPS | "
-                       f"Jarras Lev: {analyzer.lifted} | Total Obj Lev: {analyzer.total_lifted}")
-                cv2.putText(annotated, hud, (10, 27),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
-
-                if last_event_text and (now_ts - last_event_time) < 3.0:
-                    cv2.rectangle(annotated, (8, 46), (min(width - 8, 680), 82), (62, 62, 249), -1)
-                    cv2.putText(annotated, f"EVENTO: {last_event_text}", (16, 71),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
-
-                self._encode_stream_frame(annotated)
-
-            cap.release()
-        except Exception as exc:
-            self.error = mask_text(str(exc), source_str)
-        finally:
-            self.running = False
 
 
 # =====================================================================
@@ -605,7 +292,7 @@ class PipelineJobManager:
             self.running = False
 
 
-live_monitor = LiveMonitor()
+live_monitor = LiveMonitor(snapshots_dir=SNAPSHOTS_DIR)
 pipeline_job = PipelineJobManager()
 
 
@@ -1041,15 +728,18 @@ def get_live_status():
 async def stream_live_video():
     """Transmite el video procesado en tiempo real (MJPEG) sin bloquear hilos."""
     async def generate():
+        last_sent, last_time = None, 0.0
         while live_monitor.running:
-            with live_monitor._lock:
-                frame_bytes = live_monitor.latest_jpeg
-            if frame_bytes:
+            frame_bytes = live_monitor.latest_jpeg
+            now = time.monotonic()
+            # Enviar solo frames nuevos (o repetir 1 vez por segundo para mantener la conexion)
+            if frame_bytes and (frame_bytes is not last_sent or now - last_time > 1.0):
+                last_sent, last_time = frame_bytes, now
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
                 )
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
 
     return StreamingResponse(
         generate(),

@@ -420,11 +420,19 @@ export default function App() {
           <span className={`badge ${wsConnected ? 'online' : 'warn'}`}>
             WS: {wsConnected ? 'ACTIVO' : 'ESPERA'}
           </span>
-          <span className={`badge ${liveStatus.activo ? 'online' : 'warn'}`}>
+          <span
+            className={`badge ${
+              liveStatus.activo && liveStatus.conexion !== 'reconectando' ? 'online' : 'warn'
+            }`}
+          >
             CAMARA:{' '}
-            {liveStatus.activo
-              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} (${liveStatus.fps || 0} fps)`
-              : 'EN PAUSA'}
+            {!liveStatus.activo
+              ? 'EN PAUSA'
+              : liveStatus.conexion === 'reconectando'
+              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} RECONECTANDO...`
+              : liveStatus.conexion === 'conectando'
+              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} CONECTANDO...`
+              : `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} (${liveStatus.fps || 0} fps)`}
           </span>
         </div>
       </header>
@@ -597,7 +605,9 @@ export default function App() {
 
         {liveStatus.error && (
           <div className="action-banner" style={{ borderColor: '#f93e3e', color: '#b41d1d' }}>
-            Error en fuente de video: {liveStatus.error}
+            {liveStatus.conexion === 'reconectando' ? 'Camara sin senal: ' : 'Error en fuente de video: '}
+            {liveStatus.error}
+            {liveStatus.reconexiones > 0 && ` (reconexiones: ${liveStatus.reconexiones})`}
           </div>
         )}
 
