@@ -57,6 +57,9 @@ class LiveSession:
         self.zones_file = zones_file
         self.confidence = confidence
         self.is_live = is_live_source(source)
+        # Identifica las fotos de evidencia de esta sesion (no se mezclan entre videos/dias)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.tag = f"en_vivo_{stamp}" if self.is_live else f"demo_{Path(source).stem}_{stamp}"
 
         self.stop_event = threading.Event()
         self.thread = None
@@ -355,7 +358,8 @@ class LiveMonitor:
         try:
             for ev in new_events:
                 ev.snapshot_file = save_event_snapshot(
-                    frame, results, ev, analyzer.zones, self.snapshots_dir, session.camera_id
+                    frame, results, ev, analyzer.zones, self.snapshots_dir, session.camera_id,
+                    tag=session.tag,
                 )
                 db.add(KitchenEvent(
                     run_id=run_id,

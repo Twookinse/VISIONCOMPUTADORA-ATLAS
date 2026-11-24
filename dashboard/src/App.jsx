@@ -582,7 +582,10 @@ export default function App() {
             <div className="progress-header">
               <strong>
                 Analizando [{CAMERA_LABELS[jobStatus.camera_id] || jobStatus.camera_id}]{' '}
-                {jobStatus.fuente.replace('videos/', '')} — {jobStatus.progreso_pct}%
+                {jobStatus.fuente.replace('videos/', '')} —{' '}
+                {jobStatus.progreso_conocido === false
+                  ? `${jobStatus.frames_procesados} cuadros procesados`
+                  : `${jobStatus.progreso_pct}%`}
               </strong>
               <span>
                 Eventos detectados: <strong>{jobStatus.eventos_encontrados}</strong> (Jarras:{' '}

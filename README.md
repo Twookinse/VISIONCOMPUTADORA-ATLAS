@@ -14,6 +14,7 @@ Sistema de analisis por vision computacional multi-camara para la cocina y almac
 - `src/config/` - Carga y actualizacion de configuracion multi-camara.
 - `src/db/` - Modelos SQLAlchemy y persistencia en SQLite (`output/nex_vision.db`).
 - `src/api/` - Backend FastAPI (API REST, WebSocket en vivo y streaming MJPEG).
+- `src/pipeline/` - Analisis completo de videos grabados (un solo motor para el Dashboard, `/api/pipeline/*` y `scripts/run_counting.py`) y trabajos en segundo plano con progreso.
 - `src/live/` - Monitoreo en vivo: lector de camaras RTSP/USB (ultimo frame, reconexion automatica) y sesiones de conteo en tiempo real.
 - `dashboard/` - Frontend en React + Vite con selector multi-camara y filtros.
 - `scripts/` - Utilidades CLI (`run_counting.py`, `draw_zones.py`, `extract_frames.py`, `count_validator.py`).

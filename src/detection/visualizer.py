@@ -9,7 +9,9 @@ Evita el amontonamiento visual de cajas de YOLO permitiendo elegir entre:
 - 'tecnica':     Muestra todas las detecciones (nombres normalizados) para depuracion.
 """
 
+import re
 from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -153,10 +155,20 @@ def render_annotated_frame(
     return annotated
 
 
-def save_event_snapshot(frame, results, event, zones, snapshots_dir, camera_id):
+def snapshot_tag(text, max_len=40):
+    """Convierte un nombre de video o sesion en un texto seguro para nombres de archivo."""
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(str(text or "")).stem).strip("_")
+    return clean[:max_len]
+
+
+def save_event_snapshot(frame, results, event, zones, snapshots_dir, camera_id, tag=""):
     """Guarda una captura limpia del instante exacto de un evento para la bitacora.
 
     Resalta unicamente el objeto que disparo el evento y su zona ROI.
+
+    Args:
+        tag: Identificador corto del video o sesion (ej. "COCINA_1_VIDEO_2"). Evita
+            que dos videos de la misma camara se sobrescriban las fotos entre si.
 
     Returns:
         Nombre del archivo .jpg guardado (relativo a snapshots_dir).
@@ -200,7 +212,9 @@ def save_event_snapshot(frame, results, event, zones, snapshots_dir, camera_id):
         snap = cv2.resize(snap, (860, int(h * scale)), interpolation=cv2.INTER_AREA)
 
     safe_cls = event.class_name.replace(" ", "_")
-    filename = f"{camera_id}_{safe_cls}_id{event.track_id}_f{event.frame}_{event.event_type}.jpg"
+    safe_tag = snapshot_tag(tag)
+    prefix = f"{camera_id}_{safe_tag}" if safe_tag else camera_id
+    filename = f"{prefix}_{safe_cls}_id{event.track_id}_f{event.frame}_{event.event_type}.jpg"
     out_path = snapshots_dir / filename
     cv2.imwrite(str(out_path), snap, [cv2.IMWRITE_JPEG_QUALITY, 82])
     return filename
