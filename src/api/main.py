@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db, create_session_factory, PROJECT_ROOT
@@ -991,6 +992,7 @@ def start_pipeline_job(req: PipelineRunRequest):
         min_frames=req.min_frames,
         skip_frames=req.skip_frames,
         max_seconds=req.max_seconds,
+        video_start=req.video_start,
     )
     return {"mensaje": "Analisis iniciado en segundo plano", "estado": pipeline_job.status()}
 
