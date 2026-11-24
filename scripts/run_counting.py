@@ -27,6 +27,7 @@ from src.events.zones import load_zones, draw_zones
 from src.analysis.kitchen import KitchenAnalyzer
 from src.config.cameras import get_camera_by_id, detect_camera_for_source
 from src.db.models import save_report_to_db
+from src.utils.security import is_stream_url, mask_rtsp_url
 
 
 def parse_args():
@@ -78,6 +79,8 @@ def main():
     zones_rel = args.zones or (cam_cfg["zones_file"] if cam_cfg else "config/zones/cocina_1.json")
 
     source = int(args.source) if str(args.source).isdigit() else args.source
+    # Texto de la fuente sin la clave del DVR (para consola, reporte y base de datos)
+    public_source = mask_rtsp_url(str(args.source))
 
     zones = load_zones(PROJECT_ROOT / zones_rel)
     if not zones:
@@ -93,7 +96,7 @@ def main():
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        print(f"Error: no se pudo abrir la fuente '{args.source}'")
+        print(f"Error: no se pudo abrir la fuente '{public_source}'")
         sys.exit(1)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -106,7 +109,7 @@ def main():
     max_frames = int(args.max_seconds * fps) if args.max_seconds > 0 else 0
 
     print(f"Camara: {camera_id} ({cam_cfg['nombre'] if cam_cfg else camera_id})")
-    print(f"Fuente: {args.source} ({width}x{height} @ {fps:.1f} FPS, skip={skip_frames})")
+    print(f"Fuente: {public_source} ({width}x{height} @ {fps:.1f} FPS, skip={skip_frames})")
     print(f"Modelo: {args.model}")
     print(f"Zonas ({len(analyzer.zones)}): {[z.name for z in analyzer.zones]}")
     print()
@@ -114,7 +117,10 @@ def main():
     writer = None
     output_dir = PROJECT_ROOT / args.output
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_name = Path(str(source)).stem if isinstance(source, str) else camera_id
+    if isinstance(source, str) and not is_stream_url(source):
+        source_name = Path(source).stem
+    else:
+        source_name = f"{camera_id}_en_vivo"
     video_path = output_dir / f"{source_name}_conteo.mp4"
     report_path = output_dir / f"{source_name}_conteo.json"
     if is_file and not args.no_video:
@@ -190,7 +196,7 @@ def main():
 
         report = {
             "camera_id": camera_id,
-            "fuente": str(args.source),
+            "fuente": public_source,
             "modelo": args.model,
             "zonas_archivo": zones_rel,
             "frames_procesados": frame_count,

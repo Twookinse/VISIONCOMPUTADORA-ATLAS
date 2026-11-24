@@ -25,7 +25,8 @@ from src.analysis.kitchen import normalize_class_name
 from src.db.database import dispose_all_engines
 from src.db.models import save_report_to_db
 
-client = TestClient(app)
+# Simula la propia PC del servidor (los demas equipos necesitan contrasena)
+client = TestClient(app, client=("127.0.0.1", 50000))
 
 
 def setup_sample_data():

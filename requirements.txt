@@ -19,3 +19,6 @@ uvicorn==0.54.0
 sqlalchemy==2.1.6
 httpx==0.28.1
 python-multipart
+
+# Pruebas automatizadas (python -m pytest)
+pytest==9.2.0

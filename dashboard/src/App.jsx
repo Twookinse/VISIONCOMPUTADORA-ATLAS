@@ -189,7 +189,8 @@ export default function App() {
         setActionMsg(data.mensaje)
         fetchData()
       } else {
-        setActionMsg('No se pudo guardar el enlace RTSP.')
+        const err = await res.json().catch(() => ({}))
+        setActionMsg(err.detail || 'No se pudo guardar el enlace RTSP.')
       }
     } catch (e) {
       setActionMsg('Error al guardar el enlace RTSP.')
@@ -256,7 +257,12 @@ export default function App() {
           show_zones: showZones,
         }),
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setActionMsg(data.detail || 'No se pudo iniciar la transmision en vivo.')
+        setLiveStatus({ activo: false })
+        return
+      }
       setLiveStatus(data.estado || { activo: true, camera_id: targetCam, fuente: src })
       setActionMsg(`Transmitiendo con marcas [${CAMERA_LABELS[targetCam] || targetCam}]: ${src}`)
     } catch (e) {
@@ -332,7 +338,8 @@ export default function App() {
       })
 
       if (!upRes.ok) {
-        setActionMsg('No se pudo subir el archivo de video.')
+        const err = await upRes.json().catch(() => ({}))
+        setActionMsg(err.detail || 'No se pudo subir el archivo de video.')
         setUploadingVideo(false)
         return
       }

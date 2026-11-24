@@ -1,5 +1,5 @@
 {
-  "descripcion": "Configuracion central de las camaras del karaoke Nex. Al llevar el sistema al local, solo pega el enlace rtsp_url de cada camara (o guardalo desde el Dashboard).",
+  "descripcion": "PLANTILLA. El servidor crea config/cameras.json (ignorado por Git) a partir de este archivo la primera vez que arranca. Los enlaces RTSP (con usuario y clave del DVR) se guardan solo en config/cameras.json, desde el Dashboard (Guardar RTSP) o editandolo a mano. Nunca pongas claves reales en esta plantilla.",
   "modelo_default": "models/custom/jarras_nex_v1.pt",
   "camaras": [
     {

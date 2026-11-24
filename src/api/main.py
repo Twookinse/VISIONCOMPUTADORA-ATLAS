@@ -16,7 +16,6 @@ Incluye:
 import asyncio
 import json
 import os
-import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -64,10 +63,26 @@ from src.analysis.kitchen import (
     normalize_class_name,
 )
 from src.config.cameras import (
+    InvalidRtspUrl,
     get_cameras,
     get_camera_by_id,
     update_camera_rtsp,
     detect_camera_for_source,
+    public_camera,
+    unmask_source,
+)
+from src.config.settings import cors_origins, max_upload_bytes
+from src.api.auth import AccessControlMiddleware
+from src.utils.security import (
+    UnsafePathError,
+    mask_rtsp_url,
+    mask_text,
+    sanitize_upload_name,
+    unique_destination,
+    validate_model_path,
+    validate_source,
+    validate_tracker_path,
+    validate_zones_path,
 )
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -102,10 +117,33 @@ def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], z
     resolved_zones = zones_override or (
         cam_cfg["zones_file"] if cam_cfg else "config/zones/cocina_1.json"
     )
-    resolved_source = source
+    resolved_source = unmask_source(source)
     if not resolved_source and cam_cfg:
         resolved_source = cam_cfg.get("rtsp_url") or cam_cfg.get("default_video") or "0"
     return resolved_cam_id, resolved_source, resolved_zones
+
+
+def _validate_inputs(camera_id: Optional[str], source: Optional[str], zones: Optional[str],
+                     model: str, tracker: Optional[str] = None, allow_stream: bool = False):
+    """Resuelve la camara y valida que todas las rutas apunten a archivos permitidos.
+
+    Evita que la API lea o cargue archivos fuera de videos/, models/ y config/
+    (un .pt arbitrario puede ejecutar codigo al cargarse).
+
+    Returns:
+        (camera_id, source, zones, model, tracker) normalizados.
+    """
+    cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
+    try:
+        src = validate_source(resolved_src, allow_stream=allow_stream)
+        zones_rel = validate_zones_path(resolved_zones)
+        model_rel = validate_model_path(model)
+        tracker_rel = validate_tracker_path(tracker) if tracker else None
+    except UnsafePathError as exc:
+        raise HTTPException(status_code=400, detail=mask_text(str(exc), resolved_src))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return cam_id, src, zones_rel, model_rel, tracker_rel
 
 
 def _parse_video_start_or_400(source: str, video_start: Optional[str]):
@@ -162,7 +200,7 @@ class LiveMonitor:
 
         self.error = None
         self.camera_id = cam_id
-        self.source = resolved_src
+        self.source = mask_rtsp_url(resolved_src)  # Nunca exponer la clave del DVR
         self.model_name = model
         self.zones_file = resolved_zones
         self.lifted = 0
@@ -174,7 +212,7 @@ class LiveMonitor:
         placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
         cv2.putText(placeholder, f"Cargando camara {cam_id.upper()} y detector YOLO...",
                     (50, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
-        cv2.putText(placeholder, f"Fuente: {resolved_src}",
+        cv2.putText(placeholder, f"Fuente: {self.source}",
                     (50, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1)
         ok, buf = cv2.imencode(".jpg", placeholder)
         if ok:
@@ -239,9 +277,10 @@ class LiveMonitor:
                 cap_source = str(full_path if full_path.exists() else source_str)
                 is_live_camera = False
 
+            public_src = mask_rtsp_url(source_str)
             cap = cv2.VideoCapture(cap_source)
             if not cap.isOpened():
-                self.error = f"No se pudo abrir la fuente: {source_str}"
+                self.error = f"No se pudo abrir la fuente: {public_src}"
                 self.running = False
                 return
 
@@ -286,7 +325,7 @@ class LiveMonitor:
                 live_run = PipelineRun(
                     created_at=datetime.now(),
                     camera_id=cam_id,
-                    source=f"EN_VIVO: {source_str}",
+                    source=f"EN_VIVO: {public_src}",
                     model=model_rel,
                     zones_file=zones_rel,
                     mode=run_mode,
@@ -349,7 +388,7 @@ class LiveMonitor:
                                 created_at=datetime.now(),
                                 camera_id=cam_id,
                                 mode=run_mode,
-                                source=str(source_str),
+                                source=public_src,
                                 frame=ev.frame,
                                 time_s=ev.time_s,
                                 track_id=ev.track_id,
@@ -408,7 +447,7 @@ class LiveMonitor:
 
             cap.release()
         except Exception as exc:
-            self.error = str(exc)
+            self.error = mask_text(str(exc), source_str)
         finally:
             self.running = False
 
@@ -441,10 +480,9 @@ class PipelineJobManager:
         if self.running:
             raise HTTPException(status_code=409, detail="Ya hay un video analizandose en este momento")
 
-        cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
-        source_path = PROJECT_ROOT / resolved_src
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail=f"No se encontro el video '{resolved_src}'")
+        cam_id, resolved_src, resolved_zones, model, _ = _validate_inputs(
+            camera_id, source, zones, model, allow_stream=False
+        )
         start_dt, start_estimated = _parse_video_start_or_400(resolved_src, video_start)
 
         self.running = True
@@ -606,13 +644,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS solo para el Dashboard en modo desarrollo (Vite en :5173). En produccion el
+# Dashboard se sirve desde el mismo origen y no necesita CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+# Se agrega al final para que se ejecute primero: la propia PC entra libre y los
+# demas equipos necesitan usuario/contrasena (ver src/api/auth.py).
+app.add_middleware(AccessControlMiddleware)
 
 
 class PipelineRunRequest(BaseModel):
@@ -692,12 +735,36 @@ def list_available_videos():
 
 @app.post("/api/videos/upload")
 async def upload_video(file: UploadFile = File(...)):
-    """Recibe un archivo de video subido por el usuario y lo guarda en videos/."""
+    """Recibe un archivo de video subido por el usuario y lo guarda en videos/.
+
+    Solo acepta extensiones de video, nunca sobrescribe un archivo existente
+    (agrega ' (1)', ' (2)'...) y limita el tamano (NEX_MAX_UPLOAD_MB).
+    """
+    try:
+        safe_name = sanitize_upload_name(file.filename)
+    except UnsafePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(file.filename or "video_subido.mp4").name
-    dest_path = VIDEOS_DIR / safe_name
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    dest_path = unique_destination(VIDEOS_DIR, safe_name)
+    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    limit = max_upload_bytes()
+    written = 0
+    try:
+        with open(tmp_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"El video supera el limite de {limit // (1024 * 1024)} MB",
+                    )
+                buffer.write(chunk)
+        tmp_path.replace(dest_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    safe_name = dest_path.name
     rel_path = f"videos/{safe_name}"
     cam = detect_camera_for_source(rel_path)
     return {
@@ -891,12 +958,14 @@ def list_cameras(db: Session = Depends(get_db)):
             "zones_file": cam["zones_file"],
             "zonas_lista": [z.name for z in loaded_zones],
             "zona_roi": f"{len(loaded_zones)} zonas configuradas" if loaded_zones else "Sin configurar",
-            "rtsp_url": rtsp_url,
+            "rtsp_url": mask_rtsp_url(rtsp_url),
             "default_video": cam.get("default_video", ""),
             "modelo": "jarras_nex_v1.pt (Nex Oficial - 38 clases)" if model_path.exists() else "yolo26n.pt",
             "eventos_registrados": events_count,
             "ultima_actividad": last_run.created_at.isoformat() if last_run and last_run.created_at else None,
-            "fuente_actual": live_info["fuente"] if is_this_live else (rtsp_url or cam.get("default_video", "")),
+            "fuente_actual": live_info["fuente"] if is_this_live else (
+                mask_rtsp_url(rtsp_url) or cam.get("default_video", "")
+            ),
         })
 
     return {"camaras": result}
@@ -904,13 +973,19 @@ def list_cameras(db: Session = Depends(get_db)):
 
 @app.put("/api/cameras/{camera_id}")
 def save_camera_rtsp_endpoint(camera_id: str, req: CameraUpdateRequest):
-    """Guarda el enlace RTSP de una camara en config/cameras.json (listo para el local de Nex)."""
-    updated = update_camera_rtsp(camera_id, req.rtsp_url)
+    """Guarda el enlace RTSP de una camara en config/cameras.json (listo para el local de Nex).
+
+    La respuesta devuelve el enlace enmascarado (rtsp://usuario:****@IP/...).
+    """
+    try:
+        updated = update_camera_rtsp(camera_id, req.rtsp_url)
+    except InvalidRtspUrl as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not updated:
         raise HTTPException(status_code=404, detail=f"Camara '{camera_id}' no encontrada")
     return {
         "mensaje": f"Enlace RTSP guardado para {updated['nombre']}",
-        "camara": updated,
+        "camara": public_camera(updated),
     }
 
 
@@ -919,7 +994,7 @@ def get_event_snapshot(filename: str):
     """Sirve la foto de evidencia (snapshot) capturada en el instante de un evento."""
     safe_name = Path(filename).name
     file_path = SNAPSHOTS_DIR / safe_name
-    if not file_path.exists():
+    if file_path.suffix.lower() != ".jpg" or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Captura no encontrada")
     return FileResponse(str(file_path), media_type="image/jpeg")
 
@@ -927,11 +1002,14 @@ def get_event_snapshot(filename: str):
 @app.post("/api/live/start")
 def start_live_monitoring(req: LiveStartRequest):
     """Inicia el monitoreo/reproduccion con marcas para una camara de Nex."""
+    cam_id, source, zones, model, _ = _validate_inputs(
+        req.camera_id, req.source, req.zones, req.model, allow_stream=True
+    )
     live_monitor.start(
-        source=req.source,
-        camera_id=req.camera_id,
-        model=req.model,
-        zones=req.zones,
+        source=source,
+        camera_id=cam_id,
+        model=model,
+        zones=zones,
         confidence=req.confidence,
         view_mode=req.view_mode,
         show_zones=req.show_zones,
@@ -1013,26 +1091,19 @@ def cancel_pipeline_job():
 @app.post("/api/pipeline/run")
 def run_pipeline_endpoint(req: PipelineRunRequest):
     """Procesa un video grabado de forma directa y guarda los eventos en SQLite."""
-    cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(
-        req.camera_id, req.source, req.zones
+    cam_id, resolved_src, resolved_zones, model_rel, tracker_rel = _validate_inputs(
+        req.camera_id, req.source, req.zones, req.model, tracker=req.tracker, allow_stream=False
     )
-
     source_path = PROJECT_ROOT / resolved_src
-    if not source_path.exists():
-        raise HTTPException(status_code=404, detail=f"No se encontro el video '{resolved_src}'")
 
     zones = load_zones(PROJECT_ROOT / resolved_zones)
     if not zones:
         raise HTTPException(status_code=400, detail=f"No hay zonas validas en '{resolved_zones}'")
 
-    model_path = PROJECT_ROOT / req.model
-    if not model_path.exists():
-        raise HTTPException(status_code=404, detail=f"No se encontro el modelo '{req.model}'")
-
     tracker = Tracker(
-        model_path=model_path,
+        model_path=PROJECT_ROOT / model_rel,
         confidence=req.confidence,
-        tracker_type=str(PROJECT_ROOT / req.tracker),
+        tracker_type=str(PROJECT_ROOT / tracker_rel),
     )
     analyzer = KitchenAnalyzer(
         zones,
@@ -1073,7 +1144,7 @@ def run_pipeline_endpoint(req: PipelineRunRequest):
     report = {
         "camera_id": cam_id,
         "fuente": resolved_src,
-        "modelo": req.model,
+        "modelo": model_rel,
         "zonas_archivo": resolved_zones,
         "frames_procesados": frame_count,
         "duracion_video_s": round(frame_count / fps, 1),
