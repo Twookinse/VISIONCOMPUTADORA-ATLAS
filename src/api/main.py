@@ -53,6 +53,7 @@ from src.config.cameras import (
     InvalidRtspUrl,
     get_cameras,
     get_camera_by_id,
+    get_default_model,
     update_camera_rtsp,
     detect_camera_for_source,
     public_camera,
@@ -98,7 +99,7 @@ def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], z
 
 
 def _validate_inputs(camera_id: Optional[str], source: Optional[str], zones: Optional[str],
-                     model: str, tracker: Optional[str] = None, allow_stream: bool = False):
+                     model: Optional[str], tracker: Optional[str] = None, allow_stream: bool = False):
     """Resuelve la camara y valida que todas las rutas apunten a archivos permitidos.
 
     Evita que la API lea o cargue archivos fuera de videos/, models/ y config/
@@ -111,7 +112,7 @@ def _validate_inputs(camera_id: Optional[str], source: Optional[str], zones: Opt
     try:
         src = validate_source(resolved_src, allow_stream=allow_stream)
         zones_rel = validate_zones_path(resolved_zones)
-        model_rel = validate_model_path(model)
+        model_rel = validate_model_path(model or get_default_model())
         tracker_rel = validate_tracker_path(tracker) if tracker else None
     except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=mask_text(str(exc), resolved_src))
@@ -216,7 +217,7 @@ app.add_middleware(AccessControlMiddleware)
 class PipelineRunRequest(BaseModel):
     source: str = "videos/COCINA 1 VIDEO 1.mp4"
     camera_id: Optional[str] = None
-    model: str = "models/custom/jarras_nex_v1.pt"
+    model: Optional[str] = None  # None = "modelo_default" de config/cameras.json
     zones: Optional[str] = None
     tracker: str = "config/trackers/bytetrack_cocina.yaml"
     confidence: float = 0.25
@@ -230,7 +231,7 @@ class PipelineRunRequest(BaseModel):
 class LiveStartRequest(BaseModel):
     source: Optional[str] = None
     camera_id: Optional[str] = "cocina_1"
-    model: str = "models/custom/jarras_nex_v1.pt"
+    model: Optional[str] = None  # None = "modelo_default" de config/cameras.json
     zones: Optional[str] = None
     confidence: float = 0.25
     view_mode: Optional[str] = "limpia"
@@ -486,7 +487,9 @@ def list_runs(
 def list_cameras(db: Session = Depends(get_db)):
     """Devuelve las 3 camaras de Nex configuradas en config/cameras.json y su estado."""
     cams_cfg = get_cameras()
-    model_path = PROJECT_ROOT / "models/custom/jarras_nex_v1.pt"
+    default_model = get_default_model()
+    model_label = Path(default_model).name if (PROJECT_ROOT / default_model).is_file() \
+        else f"{Path(default_model).name} (no encontrado)"
     live_info = live_monitor.status()
     result = []
 
@@ -515,7 +518,7 @@ def list_cameras(db: Session = Depends(get_db)):
             "zona_roi": f"{len(loaded_zones)} zonas configuradas" if loaded_zones else "Sin configurar",
             "rtsp_url": mask_rtsp_url(rtsp_url),
             "default_video": cam.get("default_video", ""),
-            "modelo": "jarras_nex_v1.pt (Nex Oficial - 38 clases)" if model_path.exists() else "yolo26n.pt",
+            "modelo": model_label,
             "eventos_registrados": events_count,
             "ultima_actividad": last_run.created_at.isoformat() if last_run and last_run.created_at else None,
             "fuente_actual": live_info["fuente"] if is_this_live else (

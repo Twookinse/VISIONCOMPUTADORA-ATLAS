@@ -21,10 +21,9 @@ import cv2
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config.cameras import detect_camera_for_source, get_camera_by_id
+from src.config.cameras import detect_camera_for_source, get_camera_by_id, get_default_model
 from src.detection.visualizer import render_annotated_frame
 from src.pipeline.video_analysis import (
-    DEFAULT_MODEL,
     DEFAULT_TRACKER,
     AnalysisError,
     AnalysisRequest,
@@ -40,8 +39,8 @@ def parse_args():
                         help="Video, 0 para camara web, o URL RTSP (opcional si usas --camera)")
     parser.add_argument("--camera", default=None,
                         help="ID de camara de config/cameras.json: cocina_1, cocina_2 o almacen")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"Modelo YOLO (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=None,
+                        help="Modelo YOLO (default: 'modelo_default' de config/cameras.json)")
     parser.add_argument("--zones", default=None,
                         help="Archivo de zonas (si se omite, se detecta segun la camara)")
     parser.add_argument("--tracker", default=DEFAULT_TRACKER,
@@ -82,7 +81,7 @@ def build_request(args):
         camera_id=cam_cfg["id"] if cam_cfg else "cocina_1",
         source=str(source),
         zones_file=args.zones or (cam_cfg["zones_file"] if cam_cfg else "config/zones/cocina_1.json"),
-        model=args.model,
+        model=args.model or get_default_model(),
         tracker=args.tracker,
         confidence=args.confidence,
         min_frames=args.min_frames,

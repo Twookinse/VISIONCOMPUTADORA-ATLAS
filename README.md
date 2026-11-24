@@ -16,6 +16,7 @@ Sistema de analisis por vision computacional multi-camara para la cocina y almac
 - `src/api/` - Backend FastAPI (API REST, WebSocket en vivo y streaming MJPEG).
 - `src/pipeline/` - Analisis completo de videos grabados (un solo motor para el Dashboard, `/api/pipeline/*` y `scripts/run_counting.py`) y trabajos en segundo plano con progreso.
 - `src/live/` - Monitoreo en vivo: lector de camaras RTSP/USB (ultimo frame, reconexion automatica) y sesiones de conteo en tiempo real.
+- `training/` - Notebook de Google Colab para reentrenar el modelo (`entrenar_modelo_nex.ipynb`) con las clases fusionadas de `config/class_mapping.json`.
 - `dashboard/` - Frontend en React + Vite con selector multi-camara y filtros.
 - `scripts/` - Utilidades CLI (`run_counting.py`, `draw_zones.py`, `extract_frames.py`, `count_validator.py`).
 - `Iniciar_Nex.bat` - Lanzador unificado de 1 clic (inicia API + BD + Dashboard en `http://localhost:8000`).
@@ -46,3 +47,13 @@ No es necesario modificar codigo fuente. Al conectar la PC a la red local del ka
 python -m pytest tests/test_security.py tests/test_event_engine.py -v
 python tests/test_api.py
 ```
+
+## Reentrenar el modelo
+
+El dataset de Roboflow (`nex-cocina-oficial` v1) tiene 38 clases, muchas de ellas numeradas por objeto o persona (`Jarra1..Jarra5`, `Persona1..Persona6`). `config/class_mapping.json` las fusiona en 21 clases por tipo de objeto, sin volver a etiquetar.
+
+1. Abrir `training/entrenar_modelo_nex.ipynb` en Google Colab (GPU T4) y ejecutar todas las celdas.
+2. Copiar el `jarras_nex_v2.pt` descargado a `models/custom/`.
+3. En `config/cameras.json`, cambiar `"modelo_default"` a `"models/custom/jarras_nex_v2.pt"`.
+
+Para fusionar un dataset en la PC: `python scripts/merge_dataset_classes.py --src datasets/nex_roboflow --dst datasets/nex_v2`.

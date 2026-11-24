@@ -23,6 +23,7 @@ from typing import Callable, List, Optional
 import cv2
 
 from src.analysis.kitchen import KitchenAnalyzer
+from src.config.cameras import FALLBACK_MODEL, get_default_model
 from src.db.database import PROJECT_ROOT
 from src.db.models import MODE_LIVE, MODE_VIDEO, save_report_to_db
 from src.detection.tracker import Tracker
@@ -32,7 +33,7 @@ from src.live.capture import is_live_source
 from src.utils.security import mask_rtsp_url
 from src.utils.video_meta import compute_source_key
 
-DEFAULT_MODEL = "models/custom/jarras_nex_v1.pt"
+DEFAULT_MODEL = FALLBACK_MODEL  # Se usa el "modelo_default" de config/cameras.json (ver get_default_model)
 DEFAULT_TRACKER = "config/trackers/bytetrack_cocina.yaml"
 DEFAULT_FPS = 30.0
 
@@ -47,7 +48,7 @@ class AnalysisRequest:
     camera_id: str
     source: str
     zones_file: str
-    model: str = DEFAULT_MODEL
+    model: str = field(default_factory=get_default_model)
     tracker: str = DEFAULT_TRACKER
     confidence: float = 0.25
     min_frames: int = 4

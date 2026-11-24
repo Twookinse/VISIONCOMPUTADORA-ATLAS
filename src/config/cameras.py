@@ -19,6 +19,7 @@ from src.utils.security import is_masked, is_stream_url, mask_rtsp_url
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CAMERAS_CONFIG_PATH = PROJECT_ROOT / "config" / "cameras.json"
 CAMERAS_EXAMPLE_PATH = PROJECT_ROOT / "config" / "cameras.example.json"
+FALLBACK_MODEL = "models/custom/jarras_nex_v1.pt"
 
 
 class InvalidRtspUrl(ValueError):
@@ -36,7 +37,7 @@ def load_cameras_config(path=None):
     cfg_path = Path(path) if path else CAMERAS_CONFIG_PATH
     _ensure_local_config(cfg_path)
     if not cfg_path.exists():
-        return {"modelo_default": "models/custom/jarras_nex_v1.pt", "camaras": []}
+        return {"modelo_default": FALLBACK_MODEL, "camaras": []}
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -47,6 +48,15 @@ def save_cameras_config(data, path=None):
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def get_default_model(path=None):
+    """Modelo YOLO a usar si no se indica otro ("modelo_default" en config/cameras.json).
+
+    Para pasar a un modelo nuevo (ej. jarras_nex_v2.pt) basta con cambiar esa linea.
+    """
+    model = (load_cameras_config(path).get("modelo_default") or "").strip()
+    return model or FALLBACK_MODEL
 
 
 def get_cameras(path=None):
