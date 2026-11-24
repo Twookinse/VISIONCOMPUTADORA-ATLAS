@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 38
+names: ['Balde', 'Basurero', 'CajaCerveza', 'Cernidor', 'Cerveza', 'Cuchillo1', 'Envase Ketchup', 'Envase Llajua', 'Envase para platanos', 'Envase salsa', 'Jarra 1', 'Jarra1', 'Jarra2', 'Jarra3', 'Jarra4', 'Jarra5', 'JarraLicuadora', 'Licuadora', 'Licuadora2', 'Microondas', 'Persona1', 'Persona2', 'Persona3', 'Persona4', 'Persona5', 'Persona6', 'Productos culinarios', 'Tapa de olla', 'Tapa1', 'Taper', 'Taper2', 'Taper3', 'Taper4', 'Taper5', 'Vaso1', 'botella', 'olla', 'olla1']
+
+roboflow:
+  workspace: alans-workspace-2f18i
+  project: nex-cocina-oficial
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/alans-workspace-2f18i/nex-cocina-oficial/dataset/1
