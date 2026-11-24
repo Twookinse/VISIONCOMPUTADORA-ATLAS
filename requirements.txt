@@ -16,6 +16,8 @@ torchvision==0.29.1
 # Backend API y Base de Datos (Sprint 4)
 fastapi==0.162.0
 uvicorn==0.54.0
+# Soporte WebSocket para uvicorn (/ws/events). Sin esto el Dashboard no recibe eventos en vivo
+websockets==17.4
 sqlalchemy==2.1.6
 httpx==0.28.1
 python-multipart
