@@ -127,9 +127,11 @@ class KitchenAnalyzer:
         jar_classes: Lista opcional de clases normalizadas a monitorear.
             Si es None, monitorea todas las clases movibles (ignorando fijos/personas).
         min_frames: Frames consecutivos para confirmar un cambio de zona.
+        **engine_options: Ajustes opcionales del motor de eventos (margin_ratio,
+            lost_seconds, reid_max_dist_ratio). Ver ZoneEventEngine.
     """
 
-    def __init__(self, zones, jar_classes=None, min_frames=3):
+    def __init__(self, zones, jar_classes=None, min_frames=3, **engine_options):
         if jar_classes is None:
             self.monitor_all_movable = True
             self.jar_classes = set(DEFAULT_JAR_CLASSES)
@@ -147,7 +149,7 @@ class KitchenAnalyzer:
         rest_zones = [z for z in zones if z.zone_type.lower() == "reposo"]
         self.zones = rest_zones if rest_zones else list(zones)
 
-        self.engine = ZoneEventEngine(self.zones, min_frames=min_frames)
+        self.engine = ZoneEventEngine(self.zones, min_frames=min_frames, **engine_options)
         self.events = []
 
     @property
