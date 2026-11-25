@@ -4,7 +4,7 @@ Sistema de analisis por vision computacional multi-camara para la cocina y almac
 
 ## Estructura del proyecto
 
-- `config/cameras.json` - Configuracion central de las 3 camaras (enlaces RTSP y archivo de zonas ROI de cada una).
+- `config/cameras.example.json` - Plantilla de la configuracion de las 3 camaras. Al arrancar, el servidor crea `config/cameras.json` (ignorado por Git) donde se guardan los enlaces RTSP con la clave del DVR.
 - `config/zones/` - Poligonos de zonas ROI por camara (`cocina_1.json`, `cocina_2.json`, `almacen.json`).
 - `config/trackers/` - Parametros de ByteTrack ajustados para oclusiones en cocina.
 - `models/custom/` - Modelo YOLOv11 custom entrenado con las camaras reales de Nex (`jarras_nex_v1.pt`).
@@ -14,6 +14,9 @@ Sistema de analisis por vision computacional multi-camara para la cocina y almac
 - `src/config/` - Carga y actualizacion de configuracion multi-camara.
 - `src/db/` - Modelos SQLAlchemy y persistencia en SQLite (`output/nex_vision.db`).
 - `src/api/` - Backend FastAPI (API REST, WebSocket en vivo y streaming MJPEG).
+- `src/pipeline/` - Analisis completo de videos grabados (un solo motor para el Dashboard, `/api/pipeline/*` y `scripts/run_counting.py`) y trabajos en segundo plano con progreso.
+- `src/live/` - Monitoreo en vivo: lector de camaras RTSP/USB (ultimo frame, reconexion automatica) y sesiones de conteo en tiempo real.
+- `training/` - Notebook de Google Colab para reentrenar el modelo (`entrenar_modelo_nex.ipynb`) con las clases fusionadas de `config/class_mapping.json`.
 - `dashboard/` - Frontend en React + Vite con selector multi-camara y filtros.
 - `scripts/` - Utilidades CLI (`run_counting.py`, `draw_zones.py`, `extract_frames.py`, `count_validator.py`).
 - `Iniciar_Nex.bat` - Lanzador unificado de 1 clic (inicia API + BD + Dashboard en `http://localhost:8000`).
@@ -28,6 +31,29 @@ Sistema de analisis por vision computacional multi-camara para la cocina y almac
 
 No es necesario modificar codigo fuente. Al conectar la PC a la red local del karaoke Nex:
 
-1. Abrir `http://localhost:8000` (o editar `config/cameras.json`).
+1. Abrir `http://localhost:8000` (o editar `config/cameras.json`, nunca la plantilla `cameras.example.json`).
 2. Pegar el enlace `rtsp://usuario:clave@IP_DVR:554/...` correspondiente a cada camara (`cocina_1`, `cocina_2`, `almacen`) y presionar **Guardar RTSP**.
 3. Presionar **Conectar en Vivo** para comenzar el monitoreo en tiempo real.
+
+## Seguridad
+
+- **Claves RTSP:** se guardan solo en `config/cameras.json`, que no se sube a GitHub. El Dashboard, la API, la base de datos y el video muestran siempre el enlace oculto (`rtsp://admin:****@IP/...`). Para cambiar la clave hay que escribir el enlace completo de nuevo.
+- **Acceso desde otros equipos (celular, otra PC):** desde la propia PC del servidor se entra sin contrasena. Para permitir el acceso desde la red del local, copiar `.env.example` como `.env` y definir `NEX_PASSWORD` (el usuario por defecto es `nex`). Si `NEX_PASSWORD` esta vacia, el acceso remoto queda bloqueado.
+- **Archivos permitidos:** la API solo carga modelos de `models/`, zonas de `config/zones/`, trackers de `config/trackers/` y videos de `videos/`. La subida de videos acepta solo `.mp4`, `.avi`, `.mov` y `.mkv`, nunca sobrescribe un archivo existente y tiene un limite de tamano (`NEX_MAX_UPLOAD_MB`, 4096 MB por defecto).
+
+## Pruebas
+
+```
+python -m pytest tests/test_security.py tests/test_event_engine.py -v
+python tests/test_api.py
+```
+
+## Reentrenar el modelo
+
+El dataset de Roboflow (`nex-cocina-oficial` v1) tiene 38 clases, muchas de ellas numeradas por objeto o persona (`Jarra1..Jarra5`, `Persona1..Persona6`). `config/class_mapping.json` las fusiona en 21 clases por tipo de objeto, sin volver a etiquetar.
+
+1. Abrir `training/entrenar_modelo_nex.ipynb` en Google Colab (GPU T4) y ejecutar todas las celdas.
+2. Copiar el `jarras_nex_v2.pt` descargado a `models/custom/`.
+3. En `config/cameras.json`, cambiar `"modelo_default"` a `"models/custom/jarras_nex_v2.pt"`.
+
+Para fusionar un dataset en la PC: `python scripts/merge_dataset_classes.py --src datasets/nex_roboflow --dst datasets/nex_v2`.

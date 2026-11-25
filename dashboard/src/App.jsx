@@ -21,6 +21,8 @@ const CAMERA_LABELS = {
 
 export default function App() {
   const [events, setEvents] = useState([])
+  const [eventsTotal, setEventsTotal] = useState(0)
+  const [metrics, setMetrics] = useState({})
   const [hourly, setHourly] = useState([])
   const [totalsByClass, setTotalsByClass] = useState({})
   const [totalsByZone, setTotalsByZone] = useState({})
@@ -54,45 +56,50 @@ export default function App() {
   const [shiftFilter, setShiftFilter] = useState('todos')
   const [classFilter, setClassFilter] = useState('')
 
-  const fetchData = useCallback(async () => {
+  // Numero de la ultima consulta de metricas: descarta respuestas viejas que
+  // lleguen tarde (ej. si se cambia un filtro mientras otra consulta esta en camino)
+  const metricsRequestSeq = useRef(0)
+
+  // Eventos y metricas (KPIs calculados en el servidor sobre TODOS los eventos del filtro)
+  const fetchMetrics = useCallback(async () => {
+    const seq = ++metricsRequestSeq.current
     try {
       const params = new URLSearchParams()
       if (cameraFilter) params.set('camera_id', cameraFilter)
       if (dateFilter) params.set('date', dateFilter)
+      if (shiftFilter && shiftFilter !== 'todos') params.set('shift', shiftFilter)
       if (classFilter) params.set('class_name', classFilter)
 
-      const [evRes, hrRes, camRes, vidRes, liveRes, jobRes, clsRes] = await Promise.all([
+      const [evRes, hrRes] = await Promise.all([
         fetch(`${API_BASE}/api/events?${params.toString()}`),
         fetch(`${API_BASE}/api/metrics/hourly?${params.toString()}`),
-        fetch(`${API_BASE}/api/cameras`),
-        fetch(`${API_BASE}/api/videos`),
-        fetch(`${API_BASE}/api/live/status`),
-        fetch(`${API_BASE}/api/pipeline/status`),
-        fetch(`${API_BASE}/api/classes`),
       ])
-
+      if (seq !== metricsRequestSeq.current) return
       if (evRes.ok && hrRes.ok) {
-        const evData = await evRes.json()
-        const hrData = await hrRes.json()
+        const [evData, hrData] = await Promise.all([evRes.json(), hrRes.json()])
+        if (seq !== metricsRequestSeq.current) return
         setEvents(evData.eventos || [])
+        setEventsTotal(evData.total ?? (evData.eventos || []).length)
+        setMetrics(hrData)
         setHourly(hrData.por_hora || [])
         setTotalsByClass(hrData.totales_por_clase || {})
         setTotalsByZone(hrData.totales_por_zona || {})
         setApiOnline(true)
       }
-      if (camRes.ok) {
-        const camData = await camRes.json()
-        const cams = camData.camaras || []
-        setCameras(cams)
-      }
-      if (vidRes.ok) {
-        const vidData = await vidRes.json()
-        const details = vidData.detalle || []
-        setVideosDetail(details)
-        if (details.length > 0 && !selectedVideo) {
-          setSelectedVideo(details[0].path)
-        }
-      }
+    } catch (err) {
+      setApiOnline(false)
+    } finally {
+      setLoading(false)
+    }
+  }, [cameraFilter, dateFilter, shiftFilter, classFilter])
+
+  // Estado del monitor en vivo y del analisis en segundo plano (cambia seguido)
+  const fetchStatus = useCallback(async () => {
+    try {
+      const [liveRes, jobRes] = await Promise.all([
+        fetch(`${API_BASE}/api/live/status`),
+        fetch(`${API_BASE}/api/pipeline/status`),
+      ])
       if (liveRes.ok) {
         const lData = await liveRes.json()
         setLiveStatus(lData)
@@ -106,16 +113,44 @@ export default function App() {
           setLastReport(jData.ultimo_reporte)
         }
       }
+      setApiOnline(liveRes.ok || jobRes.ok)
+    } catch (err) {
+      setApiOnline(false)
+    }
+  }, [])
+
+  // Camaras, videos y clases (cambian poco)
+  const fetchCatalog = useCallback(async () => {
+    try {
+      const [camRes, vidRes, clsRes] = await Promise.all([
+        fetch(`${API_BASE}/api/cameras`),
+        fetch(`${API_BASE}/api/videos`),
+        fetch(`${API_BASE}/api/classes`),
+      ])
+      if (camRes.ok) {
+        const camData = await camRes.json()
+        setCameras(camData.camaras || [])
+      }
+      if (vidRes.ok) {
+        const vidData = await vidRes.json()
+        const details = vidData.detalle || []
+        setVideosDetail(details)
+        setSelectedVideo((prev) => prev || (details[0] ? details[0].path : ''))
+      }
       if (clsRes.ok) {
         const cData = await clsRes.json()
         setAvailableClasses(cData.clases || [])
       }
     } catch (err) {
       setApiOnline(false)
-    } finally {
-      setLoading(false)
     }
-  }, [cameraFilter, dateFilter, classFilter, selectedVideo])
+  }, [])
+
+  const fetchData = useCallback(() => {
+    fetchMetrics()
+    fetchStatus()
+    fetchCatalog()
+  }, [fetchMetrics, fetchStatus, fetchCatalog])
 
   // Sincronizar borrador RTSP y video sugerido cuando cambia la camara activa
   useEffect(() => {
@@ -125,38 +160,73 @@ export default function App() {
     }
   }, [activeCamId, cameras])
 
+  // Metricas: al cambiar un filtro, y cada 5 s (30 s si el WebSocket avisa de los eventos nuevos)
   useEffect(() => {
-    fetchData()
-    const intervalMs = jobStatus.activo ? 1500 : 4000
-    const timer = setInterval(fetchData, intervalMs)
+    fetchMetrics()
+    const timer = setInterval(fetchMetrics, wsConnected ? 30000 : 5000)
     return () => clearInterval(timer)
-  }, [fetchData, jobStatus.activo])
+  }, [fetchMetrics, wsConnected])
+
+  // Estado en vivo / analisis: rapido mientras hay algo en curso
+  const busy = jobStatus.activo || liveStatus.activo
+  useEffect(() => {
+    fetchStatus()
+    const timer = setInterval(fetchStatus, busy ? 1500 : 4000)
+    return () => clearInterval(timer)
+  }, [fetchStatus, busy])
+
+  useEffect(() => {
+    fetchCatalog()
+    const timer = setInterval(fetchCatalog, 15000)
+    return () => clearInterval(timer)
+  }, [fetchCatalog])
+
+  // Al terminar un analisis, refrescar metricas y lista de camaras de inmediato
+  const wasJobActive = useRef(false)
+  useEffect(() => {
+    if (wasJobActive.current && !jobStatus.activo) {
+      fetchMetrics()
+      fetchCatalog()
+    }
+    wasJobActive.current = jobStatus.activo
+  }, [jobStatus.activo, fetchMetrics, fetchCatalog])
+
+  // El WebSocket se abre UNA vez; usa siempre la version actual de fetchMetrics
+  const fetchMetricsRef = useRef(fetchMetrics)
+  useEffect(() => {
+    fetchMetricsRef.current = fetchMetrics
+  }, [fetchMetrics])
 
   useEffect(() => {
     let ws
     let reconnectTimer
+    let disposed = false
 
     const connectWs = () => {
+      if (disposed) return
       try {
         ws = new WebSocket(WS_URL)
         ws.onopen = () => setWsConnected(true)
-        ws.onmessage = () => fetchData()
+        ws.onmessage = () => fetchMetricsRef.current()
         ws.onclose = () => {
           setWsConnected(false)
-          reconnectTimer = setTimeout(connectWs, 4000)
+          // Solo reconectar si el componente sigue montado (antes quedaban conexiones huerfanas)
+          if (!disposed) reconnectTimer = setTimeout(connectWs, 4000)
         }
         ws.onerror = () => setWsConnected(false)
       } catch (e) {
         setWsConnected(false)
+        if (!disposed) reconnectTimer = setTimeout(connectWs, 4000)
       }
     }
 
     connectWs()
     return () => {
+      disposed = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
       if (ws) ws.close()
     }
-  }, [fetchData])
+  }, [])
 
   const handleSelectCameraTab = (camId) => {
     setCameraFilter(camId)
@@ -189,7 +259,8 @@ export default function App() {
         setActionMsg(data.mensaje)
         fetchData()
       } else {
-        setActionMsg('No se pudo guardar el enlace RTSP.')
+        const err = await res.json().catch(() => ({}))
+        setActionMsg(err.detail || 'No se pudo guardar el enlace RTSP.')
       }
     } catch (e) {
       setActionMsg('Error al guardar el enlace RTSP.')
@@ -256,7 +327,12 @@ export default function App() {
           show_zones: showZones,
         }),
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setActionMsg(data.detail || 'No se pudo iniciar la transmision en vivo.')
+        setLiveStatus({ activo: false })
+        return
+      }
       setLiveStatus(data.estado || { activo: true, camera_id: targetCam, fuente: src })
       setActionMsg(`Transmitiendo con marcas [${CAMERA_LABELS[targetCam] || targetCam}]: ${src}`)
     } catch (e) {
@@ -332,7 +408,8 @@ export default function App() {
       })
 
       if (!upRes.ok) {
-        setActionMsg('No se pudo subir el archivo de video.')
+        const err = await upRes.json().catch(() => ({}))
+        setActionMsg(err.detail || 'No se pudo subir el archivo de video.')
         setUploadingVideo(false)
         return
       }
@@ -362,31 +439,18 @@ export default function App() {
     })
   }, [hourly, shiftFilter])
 
-  const filteredEvents = useMemo(() => {
-    return events.filter((ev) => {
-      if (!ev.created_at) return true
-      const h = new Date(ev.created_at).getHours()
-      return shiftChecker(h)
-    })
-  }, [events, shiftFilter])
+  // El turno ya se filtra en el servidor; los eventos llegan filtrados
+  const filteredEvents = events
 
-  const kpis = useMemo(() => {
-    let jarrasLev = 0
-    let jarrasDev = 0
-    let objLev = 0
-    let objDev = 0
-    for (const ev of filteredEvents) {
-      const isJar = ev.class_name === 'Jarra' || ev.class_name === 'Jarra Licuadora'
-      if (ev.event_type === 'salida') {
-        objLev += 1
-        if (isJar) jarrasLev += 1
-      } else {
-        objDev += 1
-        if (isJar) jarrasDev += 1
-      }
-    }
-    return { jarrasLev, jarrasDev, objLev, objDev }
-  }, [filteredEvents])
+  // KPIs calculados por el servidor sobre TODOS los eventos del filtro
+  // (antes se contaban en el navegador solo los ultimos 300 eventos)
+  const kpis = {
+    jarrasLev: metrics.jarras_levantadas_total || 0,
+    jarrasDev: metrics.jarras_devueltas_total || 0,
+    objLev: metrics.objetos_levantados_total || 0,
+    objDev: metrics.objetos_devueltos_total || 0,
+    movimientos: metrics.total_eventos ?? eventsTotal,
+  }
 
   const maxHourlyValue = useMemo(() => {
     const vals = filteredHourly.map((h) =>
@@ -413,11 +477,19 @@ export default function App() {
           <span className={`badge ${wsConnected ? 'online' : 'warn'}`}>
             WS: {wsConnected ? 'ACTIVO' : 'ESPERA'}
           </span>
-          <span className={`badge ${liveStatus.activo ? 'online' : 'warn'}`}>
+          <span
+            className={`badge ${
+              liveStatus.activo && liveStatus.conexion !== 'reconectando' ? 'online' : 'warn'
+            }`}
+          >
             CAMARA:{' '}
-            {liveStatus.activo
-              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} (${liveStatus.fps || 0} fps)`
-              : 'EN PAUSA'}
+            {!liveStatus.activo
+              ? 'EN PAUSA'
+              : liveStatus.conexion === 'reconectando'
+              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} RECONECTANDO...`
+              : liveStatus.conexion === 'conectando'
+              ? `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} CONECTANDO...`
+              : `${(CAMERA_LABELS[liveStatus.camera_id] || liveStatus.camera_id).toUpperCase()} (${liveStatus.fps || 0} fps)`}
           </span>
         </div>
       </header>
@@ -567,7 +639,10 @@ export default function App() {
             <div className="progress-header">
               <strong>
                 Analizando [{CAMERA_LABELS[jobStatus.camera_id] || jobStatus.camera_id}]{' '}
-                {jobStatus.fuente.replace('videos/', '')} — {jobStatus.progreso_pct}%
+                {jobStatus.fuente.replace('videos/', '')} —{' '}
+                {jobStatus.progreso_conocido === false
+                  ? `${jobStatus.frames_procesados} cuadros procesados`
+                  : `${jobStatus.progreso_pct}%`}
               </strong>
               <span>
                 Eventos detectados: <strong>{jobStatus.eventos_encontrados}</strong> (Jarras:{' '}
@@ -590,7 +665,9 @@ export default function App() {
 
         {liveStatus.error && (
           <div className="action-banner" style={{ borderColor: '#f93e3e', color: '#b41d1d' }}>
-            Error en fuente de video: {liveStatus.error}
+            {liveStatus.conexion === 'reconectando' ? 'Camara sin senal: ' : 'Error en fuente de video: '}
+            {liveStatus.error}
+            {liveStatus.reconexiones > 0 && ` (reconexiones: ${liveStatus.reconexiones})`}
           </div>
         )}
 
@@ -757,7 +834,7 @@ export default function App() {
 
         <div className="kpi-card">
           <span className="kpi-title">Movimientos en Bitacora</span>
-          <strong className="kpi-value">{filteredEvents.length}</strong>
+          <strong className="kpi-value">{kpis.movimientos}</strong>
           <span className="kpi-sub">
             Filtro: {cameraFilter ? CAMERA_LABELS[cameraFilter] : 'Todas las camaras'}
           </span>
@@ -905,7 +982,13 @@ export default function App() {
 
       {/* TABLA DE BITACORA */}
       <section className="panel table-panel">
-        <h2>Detalle de Movimientos Registrados ({filteredEvents.length})</h2>
+        <h2>
+          Detalle de Movimientos Registrados (
+          {eventsTotal > filteredEvents.length
+            ? `ultimos ${Math.min(150, filteredEvents.length)} de ${eventsTotal}`
+            : eventsTotal}
+          )
+        </h2>
         {loading ? (
           <p className="empty-msg">Cargando registros...</p>
         ) : filteredEvents.length === 0 ? (

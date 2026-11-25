@@ -2,6 +2,7 @@
 Pruebas de la base de datos SQLite, normalizacion de clases Nex y endpoints Multi-Camara.
 
 Uso:
+    python -m pytest tests/test_api.py -v
     python tests/test_api.py
 """
 
@@ -10,11 +11,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Usar una base de datos temporal de prueba en output/
 TEST_DB_PATH = PROJECT_ROOT / "output" / "test_nex_vision.db"
+TEST_DB_PATH.parent.mkdir(parents=True, exist_ok=True)  # output/ no existe en un clon nuevo
 if TEST_DB_PATH.exists():
     TEST_DB_PATH.unlink()
 os.environ["NEX_DB_URL"] = f"sqlite:///{TEST_DB_PATH}"
@@ -25,7 +29,22 @@ from src.analysis.kitchen import normalize_class_name
 from src.db.database import dispose_all_engines
 from src.db.models import save_report_to_db
 
-client = TestClient(app)
+# Simula la propia PC del servidor (los demas equipos necesitan contrasena)
+client = TestClient(app, client=("127.0.0.1", 50000))
+
+
+def _cleanup_test_db():
+    dispose_all_engines()
+    if TEST_DB_PATH.exists():
+        TEST_DB_PATH.unlink()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def sample_data():
+    """Con pytest: carga los datos de ejemplo una vez y borra la BD al terminar."""
+    setup_sample_data()
+    yield
+    _cleanup_test_db()
 
 
 def setup_sample_data():
@@ -188,6 +207,4 @@ if __name__ == "__main__":
     ):
         test()
         print(f"OK  {test.__name__}")
-    dispose_all_engines()
-    if TEST_DB_PATH.exists():
-        TEST_DB_PATH.unlink()
+    _cleanup_test_db()

@@ -38,3 +38,7 @@ Thumbs.db
 node_modules/
 dashboard/node_modules/
 dashboard/dist/
+
+# Configuracion local de camaras (contiene usuario y clave RTSP del DVR).
+# En Git solo se sube la plantilla config/cameras.example.json
+config/cameras.json

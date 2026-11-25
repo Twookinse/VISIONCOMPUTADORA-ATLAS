@@ -15,34 +15,22 @@ Incluye:
 
 import asyncio
 import json
-import os
-import shutil
-import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-import cv2
-import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db, create_session_factory, PROJECT_ROOT
-from src.db.models import (
-    PipelineRun,
-    KitchenEvent,
-    save_report_to_db,
-    MODE_DEMO,
-    MODE_LIVE,
-    MODE_VIDEO,
-    COUNTED_MODES,
-)
+from src.db.models import PipelineRun, KitchenEvent, save_report_to_db
 from src.db.queries import (
     FilterError,
     SHIFTS,
@@ -52,40 +40,43 @@ from src.db.queries import (
     jornada_bounds,
     jornada_hour_order,
 )
-from src.utils.video_meta import resolve_video_start, compute_source_key
-from src.detection.tracker import Tracker
-from src.detection.visualizer import render_annotated_frame, save_event_snapshot, draw_clean_zones
-from src.events.zones import load_zones, draw_zones
+from src.utils.video_meta import resolve_video_start
+from src.events.zones import load_zones
+from src.live.monitor import LiveMonitor
+from src.pipeline.jobs import JobBusyError, VideoAnalysisJobs
+from src.pipeline.video_analysis import AnalysisRequest
 from src.analysis.kitchen import (
-    KitchenAnalyzer,
     DEFAULT_JAR_CLASSES,
     JAR_ONLY_CLASSES,
-    normalize_class_name,
 )
 from src.config.cameras import (
+    InvalidRtspUrl,
     get_cameras,
     get_camera_by_id,
+    get_default_model,
     update_camera_rtsp,
     detect_camera_for_source,
+    public_camera,
+    unmask_source,
+)
+from src.config.settings import cors_origins, max_upload_bytes
+from src.api.auth import AccessControlMiddleware
+from src.utils.security import (
+    UnsafePathError,
+    mask_rtsp_url,
+    mask_text,
+    sanitize_upload_name,
+    unique_destination,
+    validate_model_path,
+    validate_source,
+    validate_tracker_path,
+    validate_zones_path,
 )
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SNAPSHOTS_DIR = OUTPUT_DIR / "snapshots"
 VIDEOS_DIR = PROJECT_ROOT / "videos"
 DASHBOARD_DIST = PROJECT_ROOT / "dashboard" / "dist"
-
-
-def _clean_plot(results):
-    """Dibuja las detecciones usando los nombres normalizados (ej. Jarra en vez de Jarra2)."""
-    orig_names = results.names
-    try:
-        results.names = {
-            k: (normalize_class_name(v) or v)
-            for k, v in orig_names.items()
-        }
-        return results.plot()
-    finally:
-        results.names = orig_names
 
 
 def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], zones_override: Optional[str]):
@@ -101,10 +92,63 @@ def _resolve_camera_and_zones(camera_id: Optional[str], source: Optional[str], z
     resolved_zones = zones_override or (
         cam_cfg["zones_file"] if cam_cfg else "config/zones/cocina_1.json"
     )
-    resolved_source = source
+    resolved_source = unmask_source(source)
     if not resolved_source and cam_cfg:
         resolved_source = cam_cfg.get("rtsp_url") or cam_cfg.get("default_video") or "0"
     return resolved_cam_id, resolved_source, resolved_zones
+
+
+def _validate_inputs(camera_id: Optional[str], source: Optional[str], zones: Optional[str],
+                     model: Optional[str], tracker: Optional[str] = None, allow_stream: bool = False):
+    """Resuelve la camara y valida que todas las rutas apunten a archivos permitidos.
+
+    Evita que la API lea o cargue archivos fuera de videos/, models/ y config/
+    (un .pt arbitrario puede ejecutar codigo al cargarse).
+
+    Returns:
+        (camera_id, source, zones, model, tracker) normalizados.
+    """
+    cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
+    try:
+        src = validate_source(resolved_src, allow_stream=allow_stream)
+        zones_rel = validate_zones_path(resolved_zones)
+        model_rel = validate_model_path(model or get_default_model())
+        tracker_rel = validate_tracker_path(tracker) if tracker else None
+    except UnsafePathError as exc:
+        raise HTTPException(status_code=400, detail=mask_text(str(exc), resolved_src))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return cam_id, src, zones_rel, model_rel, tracker_rel
+
+
+def _analysis_request(req) -> AnalysisRequest:
+    """Valida un PipelineRunRequest y lo convierte en AnalysisRequest (HTTP 400/404 si no es valido)."""
+    cam_id, source, zones, model, tracker = _validate_inputs(
+        req.camera_id, req.source, req.zones, req.model, tracker=req.tracker, allow_stream=False
+    )
+    start_dt, start_estimated = _parse_video_start_or_400(source, req.video_start)
+    return AnalysisRequest(
+        camera_id=cam_id,
+        source=source,
+        zones_file=zones,
+        model=model,
+        tracker=tracker,
+        confidence=req.confidence,
+        min_frames=req.min_frames,
+        skip_frames=req.skip_frames,
+        max_seconds=req.max_seconds,
+        start_seconds=req.start_seconds,
+        classes=req.classes,
+        video_start=start_dt,
+        start_estimated=start_estimated,
+    )
+
+
+def _start_job_or_409(request: AnalysisRequest):
+    try:
+        return pipeline_job.start(request)
+    except JobBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 def _parse_video_start_or_400(source: str, video_start: Optional[str]):
@@ -118,456 +162,8 @@ def _parse_video_start_or_400(source: str, video_start: Optional[str]):
     return start_dt, estimated
 
 
-# =====================================================================
-# MOTOR DE MONITOREO EN TIEMPO REAL (Multi-Camara 720p RTSP / 1080p 60fps)
-# =====================================================================
-class LiveMonitor:
-    """Gestiona la captura, visualizacion con marcas y conteo en tiempo real."""
-
-    def __init__(self):
-        self.running = False
-        self.camera_id = "cocina_1"
-        self.source = ""
-        self.model_name = "models/custom/jarras_nex_v1.pt"
-        self.zones_file = "config/zones/cocina_1.json"
-        self.view_mode = "limpia"   # "limpia", "solo_jarras", "tecnica"
-        self.show_zones = True
-        self.resolution = "1280x720"
-        self.fps_actual = 0.0
-        self.lifted = 0
-        self.returned = 0
-        self.total_lifted = 0
-        self.latest_jpeg = None
-        self.error = None
-        self._thread = None
-        self._lock = threading.Lock()
-
-    def set_display(self, view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
-        """Actualiza el modo visual en caliente sin reiniciar la camara."""
-        if view_mode in ("limpia", "solo_jarras", "tecnica"):
-            self.view_mode = view_mode
-        if show_zones is not None:
-            self.show_zones = bool(show_zones)
-
-    def start(self, source: Optional[str] = None, camera_id: Optional[str] = None,
-              model: str = "models/custom/jarras_nex_v1.pt",
-              zones: Optional[str] = None, confidence: float = 0.25,
-              view_mode: Optional[str] = None, show_zones: Optional[bool] = None):
-        if self.running:
-            self.stop()
-
-        self.set_display(view_mode=view_mode, show_zones=show_zones)
-        cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
-
-        self.error = None
-        self.camera_id = cam_id
-        self.source = resolved_src
-        self.model_name = model
-        self.zones_file = resolved_zones
-        self.lifted = 0
-        self.returned = 0
-        self.total_lifted = 0
-        self.fps_actual = 0.0
-
-        # Cuadro inicial inmediato mientras carga el modelo YOLO
-        placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
-        cv2.putText(placeholder, f"Cargando camara {cam_id.upper()} y detector YOLO...",
-                    (50, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
-        cv2.putText(placeholder, f"Fuente: {resolved_src}",
-                    (50, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1)
-        ok, buf = cv2.imencode(".jpg", placeholder)
-        if ok:
-            with self._lock:
-                self.latest_jpeg = buf.tobytes()
-
-        self.running = True
-        self._thread = threading.Thread(
-            target=self._worker,
-            args=(cam_id, resolved_src, model, resolved_zones, confidence),
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self):
-        self.running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
-        self._thread = None
-
-    def status(self):
-        return {
-            "activo": self.running,
-            "camera_id": self.camera_id,
-            "fuente": self.source,
-            "modelo": self.model_name,
-            "zonas": self.zones_file,
-            "view_mode": self.view_mode,
-            "show_zones": self.show_zones,
-            "resolucion": self.resolution,
-            "fps": round(self.fps_actual, 1),
-            "jarras_levantadas_sesion": self.lifted,
-            "jarras_devueltas_sesion": self.returned,
-            "objetos_levantados_sesion": self.total_lifted,
-            "error": self.error,
-        }
-
-    def _encode_stream_frame(self, annotated):
-        """Redimensiona suavemente a max 960px de ancho para streaming MJPEG rapido."""
-        h, w = annotated.shape[:2]
-        if w > 960:
-            scale = 960.0 / w
-            annotated = cv2.resize(annotated, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
-        ok, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ok:
-            with self._lock:
-                self.latest_jpeg = buffer.tobytes()
-
-    def _worker(self, cam_id: str, source_str: str, model_rel: str, zones_rel: str, confidence: float):
-        try:
-            zones = load_zones(PROJECT_ROOT / zones_rel)
-
-            if str(source_str).lower().startswith("rtsp://"):
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer"
-                cap_source = source_str
-                is_live_camera = True
-            elif str(source_str).isdigit():
-                cap_source = int(source_str)
-                is_live_camera = True
-            else:
-                full_path = PROJECT_ROOT / source_str
-                cap_source = str(full_path if full_path.exists() else source_str)
-                is_live_camera = False
-
-            cap = cv2.VideoCapture(cap_source)
-            if not cap.isOpened():
-                self.error = f"No se pudo abrir la fuente: {source_str}"
-                self.running = False
-                return
-
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if isinstance(cap_source, int):
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-            self.resolution = f"{width}x{height}"
-
-            # Si es video grabado a 60fps de Nex, saltar los primeros segundos del logo DVR
-            if not is_live_camera and fps >= 45:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 180)
-            skip_frames = 3 if (not is_live_camera and fps >= 45) else 1
-
-            # Mostrar primer cuadro con las zonas de la camara mientras arranca YOLO
-            ret0, first_frame = cap.read()
-            # Numerar frames desde la posicion real del video para que time_s sea correcto
-            frame_idx = 0 if is_live_camera else max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
-            # Camara real (RTSP/USB) cuenta en las metricas; un video grabado es una demo
-            run_mode = MODE_LIVE if is_live_camera else MODE_DEMO
-            if ret0:
-                preview = draw_clean_zones(first_frame, zones, subtle=True) if self.show_zones else first_frame.copy()
-                cv2.rectangle(preview, (0, 0), (width, 40), (30, 34, 42), -1)
-                cv2.putText(preview, f"[{cam_id.upper()}] Iniciando modelo YOLO...",
-                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
-                self._encode_stream_frame(preview)
-
-            tracker = Tracker(
-                model_path=PROJECT_ROOT / model_rel,
-                confidence=confidence,
-                tracker_type=str(PROJECT_ROOT / "config/trackers/bytetrack_cocina.yaml"),
-            )
-            analyzer = KitchenAnalyzer(zones, jar_classes=None, min_frames=4)
-
-            session_local = create_session_factory()
-            db = session_local()
-            try:
-                live_run = PipelineRun(
-                    created_at=datetime.now(),
-                    camera_id=cam_id,
-                    source=f"EN_VIVO: {source_str}",
-                    model=model_rel,
-                    zones_file=zones_rel,
-                    mode=run_mode,
-                    video_start=datetime.now(),
-                    start_time_estimated=not is_live_camera,
-                )
-                db.add(live_run)
-                db.commit()
-                db.refresh(live_run)
-                run_id = live_run.id
-            finally:
-                db.close()
-
-            inferred_idx = 0
-            t0 = time.time()
-            last_event_text = ""
-            last_event_time = 0.0
-            # Resaltar durante 3 segundos cada objeto que acaba de cruzar una zona
-            recent_tracks = {}  # {track_id: (event_type, expire_ts)}
-
-            while self.running:
-                if is_live_camera:
-                    cap.grab()
-                ret, frame = cap.retrieve() if is_live_camera else cap.read()
-                if not ret:
-                    if not is_live_camera:
-                        break
-                    time.sleep(0.05)
-                    continue
-
-                frame_idx += 1
-                if not is_live_camera and frame_idx % skip_frames != 0:
-                    continue
-
-                inferred_idx += 1
-                now_ts = time.time()
-                results = tracker.track(frame)
-                new_events = analyzer.update(results, tracker.class_names, frame_idx, fps)
-
-                self.lifted = analyzer.lifted
-                self.returned = analyzer.returned
-                self.total_lifted = analyzer.total_lifted
-
-                if new_events:
-                    db = session_local()
-                    try:
-                        for ev in new_events:
-                            action = "LEVANTADO" if ev.event_type == "salida" else "DEVUELTO"
-                            last_event_text = f"{ev.class_name} #{ev.track_id} {action} ({ev.zone})"
-                            last_event_time = now_ts
-                            recent_tracks[ev.track_id] = (ev.event_type, now_ts + 3.0)
-
-                            snap_file = save_event_snapshot(
-                                frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
-                            )
-                            ev.snapshot_file = snap_file
-
-                            db.add(KitchenEvent(
-                                run_id=run_id,
-                                created_at=datetime.now(),
-                                camera_id=cam_id,
-                                mode=run_mode,
-                                source=str(source_str),
-                                frame=ev.frame,
-                                time_s=ev.time_s,
-                                track_id=ev.track_id,
-                                class_name=ev.class_name,
-                                zone=ev.zone,
-                                event_type=ev.event_type,
-                                snapshot_file=snap_file,
-                            ))
-                        run_obj = db.query(PipelineRun).filter(PipelineRun.id == run_id).first()
-                        if run_obj:
-                            run_obj.frames_processed = frame_idx
-                            run_obj.jarras_levantadas = analyzer.lifted
-                            run_obj.jarras_devueltas = analyzer.returned
-                            run_obj.objetos_levantados_total = analyzer.total_lifted
-                            run_obj.objetos_devueltos_total = analyzer.total_returned
-                        db.commit()
-                    finally:
-                        db.close()
-
-                # Limpiar resaltados vencidos
-                active_recent = {
-                    tid: ev_type
-                    for tid, (ev_type, exp) in recent_tracks.items()
-                    if exp > now_ts
-                }
-
-                annotated = render_annotated_frame(
-                    frame=frame,
-                    results=results,
-                    class_names=tracker.class_names,
-                    zones=analyzer.zones,
-                    view_mode=self.view_mode,
-                    show_zones=self.show_zones,
-                    recent_track_events=active_recent,
-                )
-
-                cv2.rectangle(annotated, (0, 0), (width, 40), (30, 34, 42), -1)
-                elapsed = max(0.1, now_ts - t0)
-                self.fps_actual = inferred_idx / elapsed
-                mode_label = {
-                    "limpia": "VISTA LIMPIA",
-                    "solo_jarras": "SOLO JARRAS",
-                    "tecnica": "VISTA TECNICA",
-                }.get(self.view_mode, self.view_mode.upper())
-                hud = (f"[{cam_id.upper()} | {mode_label}] {self.fps_actual:.1f} FPS | "
-                       f"Jarras Lev: {analyzer.lifted} | Total Obj Lev: {analyzer.total_lifted}")
-                cv2.putText(annotated, hud, (10, 27),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
-
-                if last_event_text and (now_ts - last_event_time) < 3.0:
-                    cv2.rectangle(annotated, (8, 46), (min(width - 8, 680), 82), (62, 62, 249), -1)
-                    cv2.putText(annotated, f"EVENTO: {last_event_text}", (16, 71),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
-
-                self._encode_stream_frame(annotated)
-
-            cap.release()
-        except Exception as exc:
-            self.error = str(exc)
-        finally:
-            self.running = False
-
-
-# =====================================================================
-# MOTOR DE ANALISIS DE VIDEOS EN SEGUNDO PLANO (Con barra de progreso %)
-# =====================================================================
-class PipelineJobManager:
-    """Procesa videos largos (8-10 min a 60fps) sin congelar el navegador."""
-
-    def __init__(self):
-        self.running = False
-        self.cancel_requested = False
-        self.camera_id = ""
-        self.source = ""
-        self.progress_pct = 0.0
-        self.frames_processed = 0
-        self.total_frames = 0
-        self.events_found = 0
-        self.jarras_found = 0
-        self.last_report = None
-        self.error = None
-        self._thread = None
-
-    def start(self, source: str, camera_id: Optional[str] = None,
-              model: str = "models/custom/jarras_nex_v1.pt",
-              zones: Optional[str] = None, confidence: float = 0.25,
-              min_frames: int = 4, skip_frames: int = 0, max_seconds: float = 0.0,
-              video_start: Optional[str] = None):
-        if self.running:
-            raise HTTPException(status_code=409, detail="Ya hay un video analizandose en este momento")
-
-        cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(camera_id, source, zones)
-        source_path = PROJECT_ROOT / resolved_src
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail=f"No se encontro el video '{resolved_src}'")
-        start_dt, start_estimated = _parse_video_start_or_400(resolved_src, video_start)
-
-        self.running = True
-        self.cancel_requested = False
-        self.camera_id = cam_id
-        self.source = resolved_src
-        self.progress_pct = 0.0
-        self.frames_processed = 0
-        self.total_frames = 0
-        self.events_found = 0
-        self.jarras_found = 0
-        self.last_report = None
-        self.error = None
-
-        self._thread = threading.Thread(
-            target=self._run_job,
-            args=(cam_id, resolved_src, model, resolved_zones, confidence, min_frames, skip_frames,
-                  max_seconds, start_dt, start_estimated),
-            daemon=True,
-        )
-        self._thread.start()
-
-    def cancel(self):
-        self.cancel_requested = True
-
-    def status(self):
-        return {
-            "activo": self.running,
-            "camera_id": self.camera_id,
-            "fuente": self.source,
-            "progreso_pct": round(self.progress_pct, 1),
-            "frames_procesados": self.frames_processed,
-            "total_frames": self.total_frames,
-            "eventos_encontrados": self.events_found,
-            "jarras_encontradas": self.jarras_found,
-            "ultimo_reporte": self.last_report,
-            "error": self.error,
-        }
-
-    def _run_job(self, cam_id, source_rel, model_rel, zones_rel, confidence, min_frames, skip_frames,
-                 max_seconds, start_dt, start_estimated):
-        try:
-            zones = load_zones(PROJECT_ROOT / zones_rel)
-            if not zones:
-                self.error = f"No hay zonas configuradas en '{zones_rel}'"
-                return
-
-            tracker = Tracker(
-                model_path=PROJECT_ROOT / model_rel,
-                confidence=confidence,
-                tracker_type=str(PROJECT_ROOT / "config/trackers/bytetrack_cocina.yaml"),
-            )
-            analyzer = KitchenAnalyzer(zones, jar_classes=None, min_frames=min_frames)
-
-            cap = cv2.VideoCapture(str(PROJECT_ROOT / source_rel))
-            if not cap.isOpened():
-                self.error = f"No se pudo abrir '{source_rel}'"
-                return
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-            eff_skip = skip_frames if skip_frames >= 1 else (3 if fps >= 45 else 1)
-            max_frames = int(max_seconds * fps) if max_seconds > 0 else total_frames
-            self.total_frames = min(total_frames, max_frames) if max_frames > 0 else total_frames
-
-            frame_count = 0
-            start_time = time.time()
-
-            try:
-                while not self.cancel_requested:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_count += 1
-                    if max_frames and frame_count > max_frames:
-                        break
-                    self.frames_processed = frame_count
-                    self.progress_pct = min(99.0, (frame_count / max(1, self.total_frames)) * 100.0)
-                    if frame_count % eff_skip != 0:
-                        continue
-                    results = tracker.track(frame)
-                    new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
-                    for ev in new_events:
-                        ev.snapshot_file = save_event_snapshot(
-                            frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
-                        )
-                    self.events_found = len(analyzer.events)
-                    self.jarras_found = analyzer.lifted
-            finally:
-                cap.release()
-
-            elapsed = time.time() - start_time
-            report = {
-                "camera_id": cam_id,
-                "fuente": source_rel,
-                "modelo": model_rel,
-                "zonas_archivo": zones_rel,
-                "frames_procesados": frame_count,
-                "duracion_video_s": round(frame_count / fps, 1),
-                "tiempo_proceso_s": round(elapsed, 1),
-                "cancelado": self.cancel_requested,
-                "modo": MODE_VIDEO,
-                "inicio_grabacion": start_dt.isoformat(),
-                "inicio_estimado": start_estimated,
-                "source_key": compute_source_key(PROJECT_ROOT / source_rel),
-                **analyzer.summary(),
-            }
-
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            report_path = OUTPUT_DIR / f"{Path(source_rel).stem}_conteo.json"
-            with open(report_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2, ensure_ascii=False)
-
-            save_report_to_db(report)
-            self.last_report = report
-            self.progress_pct = 100.0
-        except Exception as exc:
-            self.error = str(exc)
-        finally:
-            self.running = False
-
-
-live_monitor = LiveMonitor()
-pipeline_job = PipelineJobManager()
+live_monitor = LiveMonitor(snapshots_dir=SNAPSHOTS_DIR)
+pipeline_job = VideoAnalysisJobs(snapshots_dir=SNAPSHOTS_DIR, output_dir=OUTPUT_DIR)
 
 
 def seed_existing_reports_if_empty():
@@ -605,25 +201,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS solo para el Dashboard en modo desarrollo (Vite en :5173). En produccion el
+# Dashboard se sirve desde el mismo origen y no necesita CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+# Se agrega al final para que se ejecute primero: la propia PC entra libre y los
+# demas equipos necesitan usuario/contrasena (ver src/api/auth.py).
+app.add_middleware(AccessControlMiddleware)
 
 
 class PipelineRunRequest(BaseModel):
     source: str = "videos/COCINA 1 VIDEO 1.mp4"
     camera_id: Optional[str] = None
-    model: str = "models/custom/jarras_nex_v1.pt"
+    model: Optional[str] = None  # None = "modelo_default" de config/cameras.json
     zones: Optional[str] = None
     tracker: str = "config/trackers/bytetrack_cocina.yaml"
     confidence: float = 0.25
     min_frames: int = 4
     skip_frames: int = 0
     max_seconds: float = 0.0
+    start_seconds: float = 0.0
     classes: Optional[List[str]] = None
     video_start: Optional[str] = None  # Hora real de inicio de la grabacion (YYYY-MM-DDTHH:MM)
 
@@ -631,7 +233,7 @@ class PipelineRunRequest(BaseModel):
 class LiveStartRequest(BaseModel):
     source: Optional[str] = None
     camera_id: Optional[str] = "cocina_1"
-    model: str = "models/custom/jarras_nex_v1.pt"
+    model: Optional[str] = None  # None = "modelo_default" de config/cameras.json
     zones: Optional[str] = None
     confidence: float = 0.25
     view_mode: Optional[str] = "limpia"
@@ -691,12 +293,36 @@ def list_available_videos():
 
 @app.post("/api/videos/upload")
 async def upload_video(file: UploadFile = File(...)):
-    """Recibe un archivo de video subido por el usuario y lo guarda en videos/."""
+    """Recibe un archivo de video subido por el usuario y lo guarda en videos/.
+
+    Solo acepta extensiones de video, nunca sobrescribe un archivo existente
+    (agrega ' (1)', ' (2)'...) y limita el tamano (NEX_MAX_UPLOAD_MB).
+    """
+    try:
+        safe_name = sanitize_upload_name(file.filename)
+    except UnsafePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(file.filename or "video_subido.mp4").name
-    dest_path = VIDEOS_DIR / safe_name
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    dest_path = unique_destination(VIDEOS_DIR, safe_name)
+    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    limit = max_upload_bytes()
+    written = 0
+    try:
+        with open(tmp_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"El video supera el limite de {limit // (1024 * 1024)} MB",
+                    )
+                buffer.write(chunk)
+        tmp_path.replace(dest_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    safe_name = dest_path.name
     rel_path = f"videos/{safe_name}"
     cam = detect_camera_for_source(rel_path)
     return {
@@ -863,7 +489,9 @@ def list_runs(
 def list_cameras(db: Session = Depends(get_db)):
     """Devuelve las 3 camaras de Nex configuradas en config/cameras.json y su estado."""
     cams_cfg = get_cameras()
-    model_path = PROJECT_ROOT / "models/custom/jarras_nex_v1.pt"
+    default_model = get_default_model()
+    model_label = Path(default_model).name if (PROJECT_ROOT / default_model).is_file() \
+        else f"{Path(default_model).name} (no encontrado)"
     live_info = live_monitor.status()
     result = []
 
@@ -890,12 +518,14 @@ def list_cameras(db: Session = Depends(get_db)):
             "zones_file": cam["zones_file"],
             "zonas_lista": [z.name for z in loaded_zones],
             "zona_roi": f"{len(loaded_zones)} zonas configuradas" if loaded_zones else "Sin configurar",
-            "rtsp_url": rtsp_url,
+            "rtsp_url": mask_rtsp_url(rtsp_url),
             "default_video": cam.get("default_video", ""),
-            "modelo": "jarras_nex_v1.pt (Nex Oficial - 38 clases)" if model_path.exists() else "yolo26n.pt",
+            "modelo": model_label,
             "eventos_registrados": events_count,
             "ultima_actividad": last_run.created_at.isoformat() if last_run and last_run.created_at else None,
-            "fuente_actual": live_info["fuente"] if is_this_live else (rtsp_url or cam.get("default_video", "")),
+            "fuente_actual": live_info["fuente"] if is_this_live else (
+                mask_rtsp_url(rtsp_url) or cam.get("default_video", "")
+            ),
         })
 
     return {"camaras": result}
@@ -903,13 +533,19 @@ def list_cameras(db: Session = Depends(get_db)):
 
 @app.put("/api/cameras/{camera_id}")
 def save_camera_rtsp_endpoint(camera_id: str, req: CameraUpdateRequest):
-    """Guarda el enlace RTSP de una camara en config/cameras.json (listo para el local de Nex)."""
-    updated = update_camera_rtsp(camera_id, req.rtsp_url)
+    """Guarda el enlace RTSP de una camara en config/cameras.json (listo para el local de Nex).
+
+    La respuesta devuelve el enlace enmascarado (rtsp://usuario:****@IP/...).
+    """
+    try:
+        updated = update_camera_rtsp(camera_id, req.rtsp_url)
+    except InvalidRtspUrl as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not updated:
         raise HTTPException(status_code=404, detail=f"Camara '{camera_id}' no encontrada")
     return {
         "mensaje": f"Enlace RTSP guardado para {updated['nombre']}",
-        "camara": updated,
+        "camara": public_camera(updated),
     }
 
 
@@ -918,7 +554,7 @@ def get_event_snapshot(filename: str):
     """Sirve la foto de evidencia (snapshot) capturada en el instante de un evento."""
     safe_name = Path(filename).name
     file_path = SNAPSHOTS_DIR / safe_name
-    if not file_path.exists():
+    if file_path.suffix.lower() != ".jpg" or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Captura no encontrada")
     return FileResponse(str(file_path), media_type="image/jpeg")
 
@@ -926,11 +562,14 @@ def get_event_snapshot(filename: str):
 @app.post("/api/live/start")
 def start_live_monitoring(req: LiveStartRequest):
     """Inicia el monitoreo/reproduccion con marcas para una camara de Nex."""
+    cam_id, source, zones, model, _ = _validate_inputs(
+        req.camera_id, req.source, req.zones, req.model, allow_stream=True
+    )
     live_monitor.start(
-        source=req.source,
-        camera_id=req.camera_id,
-        model=req.model,
-        zones=req.zones,
+        source=source,
+        camera_id=cam_id,
+        model=model,
+        zones=zones,
         confidence=req.confidence,
         view_mode=req.view_mode,
         show_zones=req.show_zones,
@@ -962,15 +601,18 @@ def get_live_status():
 async def stream_live_video():
     """Transmite el video procesado en tiempo real (MJPEG) sin bloquear hilos."""
     async def generate():
+        last_sent, last_time = None, 0.0
         while live_monitor.running:
-            with live_monitor._lock:
-                frame_bytes = live_monitor.latest_jpeg
-            if frame_bytes:
+            frame_bytes = live_monitor.latest_jpeg
+            now = time.monotonic()
+            # Enviar solo frames nuevos (o repetir 1 vez por segundo para mantener la conexion)
+            if frame_bytes and (frame_bytes is not last_sent or now - last_time > 1.0):
+                last_sent, last_time = frame_bytes, now
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
                 )
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
 
     return StreamingResponse(
         generate(),
@@ -982,16 +624,7 @@ async def stream_live_video():
 @app.post("/api/pipeline/start")
 def start_pipeline_job(req: PipelineRunRequest):
     """Inicia el analisis de un video en segundo plano con progreso en vivo."""
-    pipeline_job.start(
-        source=req.source,
-        camera_id=req.camera_id,
-        model=req.model,
-        zones=req.zones,
-        confidence=req.confidence,
-        min_frames=req.min_frames,
-        skip_frames=req.skip_frames,
-        max_seconds=req.max_seconds,
-    )
+    _start_job_or_409(_analysis_request(req))
     return {"mensaje": "Analisis iniciado en segundo plano", "estado": pipeline_job.status()}
 
 
@@ -1009,81 +642,21 @@ def cancel_pipeline_job():
 
 
 @app.post("/api/pipeline/run")
-def run_pipeline_endpoint(req: PipelineRunRequest):
-    """Procesa un video grabado de forma directa y guarda los eventos en SQLite."""
-    cam_id, resolved_src, resolved_zones = _resolve_camera_and_zones(
-        req.camera_id, req.source, req.zones
-    )
+async def run_pipeline_endpoint(req: PipelineRunRequest):
+    """Analiza un video completo y responde cuando termina (pensado para scripts y Swagger).
 
-    source_path = PROJECT_ROOT / resolved_src
-    if not source_path.exists():
-        raise HTTPException(status_code=404, detail=f"No se encontro el video '{resolved_src}'")
-
-    zones = load_zones(PROJECT_ROOT / resolved_zones)
-    if not zones:
-        raise HTTPException(status_code=400, detail=f"No hay zonas validas en '{resolved_zones}'")
-
-    model_path = PROJECT_ROOT / req.model
-    if not model_path.exists():
-        raise HTTPException(status_code=404, detail=f"No se encontro el modelo '{req.model}'")
-
-    tracker = Tracker(
-        model_path=model_path,
-        confidence=req.confidence,
-        tracker_type=str(PROJECT_ROOT / req.tracker),
-    )
-    analyzer = KitchenAnalyzer(
-        zones,
-        jar_classes=req.classes,
-        min_frames=req.min_frames,
-    )
-
-    cap = cv2.VideoCapture(str(source_path))
-    if not cap.isOpened():
-        raise HTTPException(status_code=400, detail=f"No se pudo abrir el video '{resolved_src}'")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    eff_skip = req.skip_frames if req.skip_frames >= 1 else (3 if fps >= 45 else 1)
-    max_frames = int(req.max_seconds * fps) if req.max_seconds > 0 else 0
-    frame_count = 0
-    start_time = time.time()
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_count += 1
-            if max_frames and frame_count > max_frames:
-                break
-            if frame_count % eff_skip != 0:
-                continue
-            results = tracker.track(frame)
-            new_events = analyzer.update(results, tracker.class_names, frame_count, fps)
-            for ev in new_events:
-                ev.snapshot_file = save_event_snapshot(
-                    frame, results, ev, analyzer.zones, SNAPSHOTS_DIR, cam_id
-                )
-    finally:
-        cap.release()
-
-    elapsed = time.time() - start_time
-    report = {
-        "camera_id": cam_id,
-        "fuente": resolved_src,
-        "modelo": req.model,
-        "zonas_archivo": resolved_zones,
-        "frames_procesados": frame_count,
-        "duracion_video_s": round(frame_count / fps, 1),
-        "tiempo_proceso_s": round(elapsed, 1),
-        **analyzer.summary(),
-    }
-
-    run_id = save_report_to_db(report)
+    Usa el mismo motor que el Dashboard (/api/pipeline/start): un solo analisis a
+    la vez (409 si hay otro en curso). La espera no bloquea el servidor.
+    """
+    job = _start_job_or_409(_analysis_request(req))
+    while job.running:
+        await asyncio.sleep(0.5)
+    if job.error:
+        raise HTTPException(status_code=500, detail=job.error)
     return {
-        "run_id": run_id,
+        "run_id": job.run_id,
         "mensaje": "Video procesado y eventos guardados en SQLite",
-        "reporte": report,
+        "reporte": job.report,
     }
 
 

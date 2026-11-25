@@ -1,0 +1,23 @@
+# Normalizar finales de linea de los archivos de texto (LF dentro del repositorio)
+* text=auto
+
+# Scripts de Windows: siempre CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Archivos binarios: Git nunca debe convertirlos (un .pt convertido LF->CRLF queda corrupto)
+*.pt binary
+*.pth binary
+*.onnx binary
+*.engine binary
+*.db binary
+*.sqlite binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.ico binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.mkv binary
+*.zip binary

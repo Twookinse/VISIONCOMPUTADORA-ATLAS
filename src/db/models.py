@@ -12,6 +12,9 @@ Modos de una corrida:
 - "live":  monitoreo de una camara real (RTSP / USB) (cuenta en las metricas).
 - "demo":  reproduccion con marcas de un video grabado. Se guarda para ver la
            evidencia, pero se EXCLUYE de las metricas para no duplicar conteos.
+- "prueba": analisis de un TRAMO de un video (--start-seconds / --max-seconds),
+           para comparar con un conteo manual. Se EXCLUYE de las metricas y no
+           reemplaza el analisis completo del mismo video.
 """
 
 from datetime import datetime, timedelta
@@ -27,6 +30,7 @@ from src.utils.video_meta import parse_datetime_input, compute_source_key
 MODE_VIDEO = "video"
 MODE_LIVE = "live"
 MODE_DEMO = "demo"
+MODE_TEST = "prueba"
 COUNTED_MODES = (MODE_VIDEO, MODE_LIVE)
 
 SNAPSHOTS_DIR = PROJECT_ROOT / "output" / "snapshots"
