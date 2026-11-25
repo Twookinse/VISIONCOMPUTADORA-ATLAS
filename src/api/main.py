@@ -137,6 +137,7 @@ def _analysis_request(req) -> AnalysisRequest:
         min_frames=req.min_frames,
         skip_frames=req.skip_frames,
         max_seconds=req.max_seconds,
+        start_seconds=req.start_seconds,
         classes=req.classes,
         video_start=start_dt,
         start_estimated=start_estimated,
@@ -224,6 +225,7 @@ class PipelineRunRequest(BaseModel):
     min_frames: int = 4
     skip_frames: int = 0
     max_seconds: float = 0.0
+    start_seconds: float = 0.0
     classes: Optional[List[str]] = None
     video_start: Optional[str] = None  # Hora real de inicio de la grabacion (YYYY-MM-DDTHH:MM)
 

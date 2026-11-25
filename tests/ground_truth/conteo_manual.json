@@ -1,6 +1,23 @@
 {
-  "descripcion": "Conteo manual (ground truth) de jarras levantadas en los videos de prueba. Se usa para medir la precision del conteo automatico.",
+  "descripcion": "Conteo manual (ground truth) de levantamientos en los videos de prueba. Se usa para medir la precision del conteo automatico con scripts/count_validator.py. Se recomienda anotar el SEGUNDO del video de cada levantamiento (ver '_ejemplo_por_eventos'); las claves que empiezan con '_' se ignoran.",
   "videos": {
+    "_ejemplo_por_eventos": {
+      "_como_usar": "Copiar este bloque, cambiar la clave por el nombre exacto del video (ej. 'COCINA 2 VIDEO 2.mp4') y anotar el segundo del video en que cada jarra SALE de su zona (se levanta). Solo se compara el tramo revisado.",
+      "revisado_desde_s": 120,
+      "revisado_hasta_s": 210,
+      "levantamientos": [
+        {
+          "segundo": 131.5,
+          "clase": "Jarra",
+          "nota": "jarra de la mesa central"
+        },
+        {
+          "segundo": 178,
+          "clase": "Jarra",
+          "nota": "la tapa una persona al levantarla"
+        }
+      ]
+    },
     "VIDEO 2 VISION COMPUTADORA.mp4": {
       "jarras_levantadas": 3,
       "visibles": 2,

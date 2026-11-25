@@ -25,7 +25,7 @@ import cv2
 from src.analysis.kitchen import KitchenAnalyzer
 from src.config.cameras import FALLBACK_MODEL, get_default_model
 from src.db.database import PROJECT_ROOT
-from src.db.models import MODE_LIVE, MODE_VIDEO, save_report_to_db
+from src.db.models import MODE_LIVE, MODE_TEST, MODE_VIDEO, save_report_to_db
 from src.detection.tracker import Tracker
 from src.detection.visualizer import save_event_snapshot
 from src.events.zones import load_zones
@@ -53,7 +53,8 @@ class AnalysisRequest:
     confidence: float = 0.25
     min_frames: int = 4
     skip_frames: int = 0          # 0 = automatico (3 en videos de 45+ fps, 1 en el resto)
-    max_seconds: float = 0.0      # 0 = video completo
+    max_seconds: float = 0.0      # 0 = hasta el final del video
+    start_seconds: float = 0.0    # Segundo del video desde donde empezar
     classes: Optional[List[str]] = None
     video_start: Optional[datetime] = None  # Hora real de inicio de la grabacion
     start_estimated: bool = True
@@ -67,11 +68,20 @@ class AnalysisRequest:
         return mask_rtsp_url(self.source)
 
     @property
+    def is_partial(self):
+        """True si se analiza solo un tramo del video (no cuenta en las metricas)."""
+        return not self.is_live and (self.start_seconds > 0 or self.max_seconds > 0)
+
+    @property
     def report_name(self):
         """Nombre base de los archivos de salida (reporte JSON, video anotado)."""
         if self.is_live:
             return f"{self.camera_id}_en_vivo"
-        return Path(self.source).stem
+        name = Path(self.source).stem
+        if self.is_partial:
+            end = f"{self.start_seconds + self.max_seconds:g}" if self.max_seconds > 0 else "fin"
+            name += f"_tramo_{self.start_seconds:g}-{end}s"
+        return name
 
 
 @dataclass
@@ -136,8 +146,17 @@ def analyze_video(request, snapshots_dir, tracker_factory=Tracker, capture_facto
         fps = _sane_fps(cap.get(cv2.CAP_PROP_FPS))
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         max_frames = int(request.max_seconds * fps) if request.max_seconds > 0 else None
+        # Saltar al inicio del tramo; los tiempos de los eventos siguen siendo los del video
+        start_frame = int(request.start_seconds * fps) if (request.start_seconds > 0 and not request.is_live) else 0
+        if start_frame:
+            if frame_count and start_frame >= frame_count:
+                raise AnalysisError(f"El video dura {frame_count / fps:.0f} s: no se puede empezar en el segundo "
+                                    f"{request.start_seconds:g}")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         if request.is_live or frame_count <= 0:
             frame_count = None  # Largo desconocido: se procesa hasta que el video termine
+        else:
+            frame_count -= start_frame
         progress.total_frames = min(filter(None, (frame_count, max_frames)), default=None)
         skip = request.skip_frames if request.skip_frames >= 1 else (3 if fps >= 45 else 1)
 
@@ -161,7 +180,7 @@ def analyze_video(request, snapshots_dir, tracker_factory=Tracker, capture_facto
                 if not ok:
                     break
                 progress.frames_read += 1
-                frame_idx = progress.frames_read
+                frame_idx = start_frame + progress.frames_read
                 if frame_idx % skip == 0:
                     progress.frames_inferred += 1
                     results = tracker.track(frame)
@@ -182,12 +201,18 @@ def analyze_video(request, snapshots_dir, tracker_factory=Tracker, capture_facto
     finally:
         cap.release()
 
-    return build_report(request, analyzer, progress, fps, clock.elapsed(), cancelled)
+    return build_report(request, analyzer, progress, fps, clock.elapsed(), cancelled, start_frame)
 
 
-def build_report(request, analyzer, progress, fps, elapsed_s, cancelled):
+def build_report(request, analyzer, progress, fps, elapsed_s, cancelled, start_frame=0):
     """Arma el diccionario de reporte que se guarda en JSON y en SQLite."""
     start = request.video_start or datetime.now()
+    if request.is_live:
+        mode = MODE_LIVE
+    elif request.is_partial:
+        mode = MODE_TEST
+    else:
+        mode = MODE_VIDEO
     return {
         "camera_id": request.camera_id,
         "fuente": request.public_source,
@@ -195,10 +220,11 @@ def build_report(request, analyzer, progress, fps, elapsed_s, cancelled):
         "zonas_archivo": request.zones_file,
         "frames_procesados": progress.frames_read,
         "frames_inferidos": progress.frames_inferred,
+        "inicio_tramo_s": round(start_frame / fps, 1),
         "duracion_video_s": round(progress.frames_read / fps, 1),
         "tiempo_proceso_s": round(elapsed_s, 1),
         "cancelado": cancelled,
-        "modo": MODE_LIVE if request.is_live else MODE_VIDEO,
+        "modo": mode,
         "inicio_grabacion": start.isoformat(),
         "inicio_estimado": bool(request.start_estimated and not request.is_live),
         "source_key": None if request.is_live else compute_source_key(PROJECT_ROOT / request.source),

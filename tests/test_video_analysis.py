@@ -319,3 +319,60 @@ def test_api_pipeline_run_responde_409_si_esta_ocupado(tmp_path, monkeypatch, ap
     assert client.post("/api/pipeline/start", json=body).status_code == 409
     jobs.cancel()
     jobs.current.done.wait(5)
+
+
+# ---------------------------------------------------------------------
+# Analisis de un tramo del video (para comparar con un conteo manual)
+# ---------------------------------------------------------------------
+class SeekableVideo(FakeVideo):
+    """FakeVideo que permite saltar a un frame (CAP_PROP_POS_FRAMES)."""
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self.read_count = int(value)
+        return True
+
+
+def test_tramo_del_video_conserva_los_tiempos_reales(tmp_path):
+    FakeTracker.lift_at = 4500  # la jarra se levanta en el frame 4500 = segundo 150 (30 fps)
+    try:
+        video = SeekableVideo(frames=9000, fps=30)
+        req = request(start_seconds=120, max_seconds=60)
+        report = run(video, req=req, tmp_path=tmp_path)
+    finally:
+        FakeTracker.lift_at = 60
+    assert report["frames_procesados"] == 1800          # solo 60 s
+    assert report["inicio_tramo_s"] == 120.0
+    assert report["jarras_levantadas"] == 1
+    assert 150 <= report["eventos"][0]["time_s"] <= 151  # tiempo del video, no del tramo
+    assert report["modo"] == "prueba"                    # no cuenta en las metricas
+    assert req.report_name == "COCINA 1 VIDEO 2_tramo_120-180s"
+
+
+def test_video_completo_sigue_en_modo_video(tmp_path):
+    req = request()
+    report = run(FakeVideo(), req=req, tmp_path=tmp_path)
+    assert report["modo"] == "video" and report["inicio_tramo_s"] == 0.0
+    assert not req.is_partial and req.report_name == "COCINA 1 VIDEO 2"
+
+
+def test_tramo_fuera_del_video_es_error(tmp_path):
+    with pytest.raises(va.AnalysisError, match="no se puede empezar"):
+        run(SeekableVideo(frames=300, fps=30), req=request(start_seconds=60), tmp_path=tmp_path)
+
+
+def test_tramo_no_reemplaza_el_analisis_completo(tmp_path):
+    from src.db.database import create_session_factory
+    from src.db.models import PipelineRun, save_report_to_db
+
+    db_path = tmp_path / "tramo.db"
+    full = run(FakeVideo(), req=request(), tmp_path=tmp_path)
+    save_report_to_db(full, db_path=db_path)
+    partial = run(SeekableVideo(frames=300), req=request(start_seconds=2, max_seconds=5), tmp_path=tmp_path)
+    save_report_to_db(partial, db_path=db_path)
+    db = create_session_factory(db_path=db_path)()
+    try:
+        modes = sorted(r.mode for r in db.query(PipelineRun).all())
+    finally:
+        db.close()
+    assert modes == ["prueba", "video"]  # antes el tramo borraba el analisis completo

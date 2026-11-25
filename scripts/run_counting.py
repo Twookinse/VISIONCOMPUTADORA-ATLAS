@@ -8,6 +8,7 @@ Usa el mismo motor de analisis que el Dashboard (src/pipeline/video_analysis.py)
 Uso:
     python scripts/run_counting.py --source "videos/COCINA 1 VIDEO 1.mp4"
     python scripts/run_counting.py --source "videos/COCINA 1 VIDEO 1.mp4" --video-start 2026-11-22T21:30
+    python scripts/run_counting.py --source "videos/COCINA 2 VIDEO 2.mp4" --start-seconds 120 --max-seconds 90
     python scripts/run_counting.py --camera cocina_2
     python scripts/run_counting.py --source rtsp://ip:554/stream --camera cocina_1 --show
 """
@@ -53,8 +54,11 @@ def parse_args():
                         help="Frames procesados para confirmar una salida o entrada (default: 4)")
     parser.add_argument("--skip-frames", type=int, default=0,
                         help="Procesar 1 de cada N frames (0 = automatico: 3 en 60fps, 1 en 30fps)")
+    parser.add_argument("--start-seconds", type=float, default=0.0,
+                        help="Opcional: segundo del video desde donde empezar (ej. 120 = minuto 2)")
     parser.add_argument("--max-seconds", type=float, default=0.0,
-                        help="Opcional: limitar analisis a los primeros N segundos (0 = video completo)")
+                        help="Opcional: analizar solo N segundos (0 = hasta el final). Un tramo se guarda "
+                             "en modo 'prueba': no cuenta en las metricas ni reemplaza el analisis completo")
     parser.add_argument("--video-start", default=None,
                         help="Hora real de inicio de la grabacion (YYYY-MM-DDTHH:MM). Si se omite, "
                              "se intenta leer del nombre del archivo del DVR")
@@ -87,6 +91,7 @@ def build_request(args):
         min_frames=args.min_frames,
         skip_frames=args.skip_frames,
         max_seconds=args.max_seconds,
+        start_seconds=args.start_seconds,
         classes=args.classes,
     )
     if not request.is_live:
@@ -110,7 +115,7 @@ class AnnotatedOutput:
         self.writer = None
         self.last_event_text = ""
         self.last_event_frame = -999
-        self.last_frame_idx = 0
+        self.last_frame_idx = None
 
     def __call__(self, frame, results, analyzer, new_events, frame_idx, fps):
         for event in new_events:
@@ -140,7 +145,9 @@ class AnnotatedOutput:
                 self.writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"mp4v"),
                                               fps, (width, height))
             # Repetir el frame anotado para cubrir los frames que no se analizaron
-            for _ in range(max(1, frame_idx - self.last_frame_idx)):
+            # (en un tramo, el primer frame no se repite por los frames saltados al inicio)
+            repeat = 1 if self.last_frame_idx is None else max(1, frame_idx - self.last_frame_idx)
+            for _ in range(repeat):
                 self.writer.write(annotated)
         self.last_frame_idx = frame_idx
 
@@ -166,6 +173,9 @@ def main():
     print(f"Fuente: {request.public_source}")
     print(f"Modelo: {request.model}")
     print(f"Zonas:  {request.zones_file}")
+    if request.is_partial:
+        fin = f"{request.start_seconds + request.max_seconds:g} s" if request.max_seconds > 0 else "el final"
+        print(f"Tramo:  desde {request.start_seconds:g} s hasta {fin} (modo prueba: no cuenta en las metricas)")
     if not request.is_live:
         estimado = " (estimada)" if request.start_estimated else ""
         print(f"Inicio de la grabacion: {request.video_start:%Y-%m-%d %H:%M}{estimado}")
